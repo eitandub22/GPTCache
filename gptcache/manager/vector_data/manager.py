@@ -144,9 +144,19 @@ class VectorBase:
 
             dimension = kwargs.get("dimension", DIMENSION)
             index_path = kwargs.pop("index_path", FAISS_INDEX_PATH)
+            index_type = kwargs.get("index_type", "flat")
+            hnsw_m = kwargs.get("hnsw_m", 32)
+            hnsw_ef_construction = kwargs.get("hnsw_ef_construction", 200)
+            hnsw_ef_search = kwargs.get("hnsw_ef_search", 128)
             VectorBase.check_dimension(dimension)
             vector_base = Faiss(
-                index_file_path=index_path, dimension=dimension, top_k=top_k
+                index_file_path=index_path,
+                dimension=dimension,
+                top_k=top_k,
+                index_type=index_type,
+                hnsw_m=hnsw_m,
+                hnsw_ef_construction=hnsw_ef_construction,
+                hnsw_ef_search=hnsw_ef_search,
             )
         elif name == "chromadb":
             from gptcache.manager.vector_data.chroma import Chromadb

@@ -48,7 +48,7 @@ def run():
     has_data = os.path.isfile(sqlite_file) and os.path.isfile(faiss_file)
 
     cache_base = CacheBase("sqlite")
-    vector_base = VectorBase("faiss", dimension=embedding_onnx.dimension)
+    vector_base = VectorBase("faiss", dimension=embedding_onnx.dimension, index_type='hnsw_sq8')
     data_manager = get_data_manager(cache_base, vector_base, max_size=100000)
     cache.init(
         embedding_func=embedding_onnx.to_embeddings,
@@ -121,6 +121,11 @@ def run():
             print(f"  {filepath}: {size_str} ({size_bytes:,} bytes)")
         else:
             print(f"  {filepath}: FILE NOT FOUND!")
+    # Also check for tombstone file
+    tombstone_file = faiss_file + ".tombstones.npy"
+    if os.path.isfile(tombstone_file):
+        size_bytes = os.path.getsize(tombstone_file)
+        print(f"  {tombstone_file}: {size_bytes:,} bytes")
 
 
 if __name__ == "__main__":

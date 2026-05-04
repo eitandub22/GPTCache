@@ -31,6 +31,82 @@ class TestLocalIndex(unittest.TestCase):
                 name='faiss', top_k=3, dimension=DIM, index_path=index_path
             )
 
+    def test_faiss_hnsw_sq8(self):
+        """Test HNSW+SQ8 index: add, search, tombstone deletion, rebuild, persistence."""
+        cls = partial(Faiss, dimension=DIM, index_type="hnsw_sq8")
+
+        # --- Basic add and search ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            self.assertEqual(index.index_type, "hnsw_sq8")
+            self.assertEqual(len(index.search(data[0])), TOP_K)
+            # Nearest neighbor of data[0] should be itself (id=0)
+            self.assertEqual(index.search(data[0])[0][1], 0)
+
+        # --- Tombstone deletion filters results ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            # Delete id=0, search for data[0] should NOT return id=0
+            index.delete([0])
+            results = index.search(data[0])
+            result_ids = [r[1] for r in results]
+            self.assertNotIn(0, result_ids)
+            # ntotal still includes tombstoned vectors
+            self.assertEqual(index.count(), SIZE)
+
+        # --- Rebuild clears tombstones ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            index.delete([0, 1, 2])
+            self.assertEqual(len(index._tombstones), 3)
+            index.rebuild(list(range(3, SIZE)))
+            self.assertEqual(len(index._tombstones), 0)
+
+        # --- Persistence: tombstones survive save/load ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            index.delete([0, 1])
+            index.close()  # flush index + tombstones to disk
+
+            # Reload and verify tombstones were restored
+            new_index = cls(index_file_path=index_path, top_k=TOP_K)
+            self.assertEqual(len(new_index._tombstones), 2)
+            results = new_index.search(data[0])
+            result_ids = [r[1] for r in results]
+            self.assertNotIn(0, result_ids)
+            self.assertNotIn(1, result_ids)
+
+        # --- Create via VectorBase factory ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = VectorBase(
+                'faiss', top_k=3, dimension=DIM,
+                index_path=index_path, index_type='hnsw_sq8'
+            )
+            data = np.random.randn(100, DIM).astype(np.float32)
+            index.mul_add([VectorData(id=i, data=v) for v, i in zip(data, range(100))])
+            self.assertEqual(index.search(data[0])[0][1], 0)
+
     def test_hnswlib(self):
         cls = partial(Hnswlib, max_elements=MAX_ELEMENTS, dimension=DIM)
         self._internal_test_normal(cls)
