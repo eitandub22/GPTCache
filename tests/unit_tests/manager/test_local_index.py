@@ -1,3 +1,4 @@
+import os
 import unittest
 from functools import partial
 from pathlib import Path
@@ -64,7 +65,7 @@ class TestLocalIndex(unittest.TestCase):
             # ntotal still includes tombstoned vectors
             self.assertEqual(index.count(), SIZE)
 
-        # --- Rebuild clears tombstones ---
+        # --- Rebuild preserves tombstones (HNSW cannot physically evict vectors) ---
         with TemporaryDirectory(dir='./') as root:
             index_path = str((Path(root) / 'index.bin').absolute())
             index = cls(index_file_path=index_path, top_k=TOP_K)
@@ -75,7 +76,9 @@ class TestLocalIndex(unittest.TestCase):
             index.delete([0, 1, 2])
             self.assertEqual(len(index._tombstones), 3)
             index.rebuild(list(range(3, SIZE)))
-            self.assertEqual(len(index._tombstones), 0)
+            # Tombstones must NOT be cleared — HNSW keeps deleted vectors in the
+            # graph; clearing the tombstone set would make them reappear in search.
+            self.assertEqual(len(index._tombstones), 3)
 
         # --- Persistence: tombstones survive save/load ---
         with TemporaryDirectory(dir='./') as root:
@@ -95,6 +98,49 @@ class TestLocalIndex(unittest.TestCase):
             result_ids = [r[1] for r in results]
             self.assertNotIn(0, result_ids)
             self.assertNotIn(1, result_ids)
+
+        # --- Rebuild keeps deleted IDs filtered in search ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            index.delete([0, 1, 2])
+            index.rebuild(list(range(3, SIZE)))
+            # Tombstones stay — deleted IDs must not appear in search results
+            self.assertEqual(len(index._tombstones), 3)
+            results = index.search(data[0])
+            result_ids = [r[1] for r in results]
+            self.assertNotIn(0, result_ids, "id=0 must remain filtered after rebuild")
+            self.assertNotIn(1, result_ids, "id=1 must remain filtered after rebuild")
+            self.assertNotIn(2, result_ids, "id=2 must remain filtered after rebuild")
+
+        # --- Tombstone file persists after rebuild+flush and survives reload ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            tombstone_path = index_path + ".tombstones.npy"
+            index = cls(index_file_path=index_path, top_k=TOP_K)
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            index.delete([0, 1])
+            index.rebuild(list(range(2, SIZE)))
+            index.close()
+            # Tombstone file must still exist — tombstones were preserved
+            self.assertTrue(
+                os.path.isfile(tombstone_path),
+                "tombstone file must be written since tombstones are preserved after rebuild"
+            )
+            # Reload — deleted IDs must still be filtered
+            reloaded = cls(index_file_path=index_path, top_k=TOP_K)
+            self.assertEqual(len(reloaded._tombstones), 2)
+            results = reloaded.search(data[0])
+            result_ids = [r[1] for r in results]
+            self.assertNotIn(0, result_ids, "id=0 must remain filtered after reload post-rebuild")
+            self.assertNotIn(1, result_ids, "id=1 must remain filtered after reload post-rebuild")
 
         # --- Create via VectorBase factory ---
         with TemporaryDirectory(dir='./') as root:

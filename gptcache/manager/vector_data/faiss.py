@@ -58,6 +58,9 @@ class Faiss(VectorBase):
         self._dimension = dimension
         self._top_k = top_k
         self._index_type = index_type.lower()
+        self._hnsw_m = hnsw_m
+        self._hnsw_ef_construction = hnsw_ef_construction
+        self._hnsw_ef_search = hnsw_ef_search
 
         # For HNSW: tombstone set of deleted IDs (since HNSW can't do remove_ids)
         self._tombstones = set()
@@ -163,11 +166,24 @@ class Faiss(VectorBase):
             return list(zip(dist[0], ids))
 
     def rebuild(self, ids=None):
-        """Rebuild the index, optionally keeping only the specified IDs.
+        """Rebuild the index, removing physically deleted vectors where possible.
 
-        For HNSW+SQ8, this clears the tombstone set since the rebuild
-        creates a fresh index from the remaining live vectors.
+        For flat: clears the (unused) tombstone set — physical removal was
+        already done by ``remove_ids`` in ``delete()``.
+        For hnsw_sq8: ``IndexHNSWSQ`` does not expose a decode path for stored
+        SQ8 codes, so structural compaction is not possible here. Tombstones
+        are intentionally **kept** so that evicted IDs continue to be filtered
+        out of search results in all subsequent calls to ``search()``.
+
+        The tombstone set is bounded by the total number of evictions over the
+        cache lifetime (each eviction adds at most one entry). At 8 bytes per
+        int64, even 1 million cumulative evictions costs only ~8 MB.
         """
+        if self._index_type == "hnsw_sq8":
+            # HNSW cannot physically remove vectors. Tombstones remain active
+            # and must NOT be cleared — clearing them would allow deleted
+            # vectors to reappear in search results.
+            return True
         self._tombstones.clear()
         return True
 
@@ -193,10 +209,13 @@ class Faiss(VectorBase):
 
     def flush(self):
         faiss.write_index(self._index, self._index_file_path)
-        # Persist tombstones alongside the index
+        tombstone_path = self._index_file_path + ".tombstones.npy"
         if self._tombstones:
-            tombstone_path = self._index_file_path + ".tombstones.npy"
             np.save(tombstone_path, np.array(list(self._tombstones)))
+        elif os.path.isfile(tombstone_path):
+            # Remove stale tombstone file left over from a previous flush so
+            # that a subsequent load does not restore already-evicted IDs.
+            os.remove(tombstone_path)
 
     def close(self):
         self.flush()
