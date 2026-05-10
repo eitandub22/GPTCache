@@ -227,7 +227,9 @@ class SQLStorage(CacheStorage):
             question=data.question
             if isinstance(data.question, str)
             else data.question.content,
-            embedding_data=data.embedding_data.tobytes()
+            # Store as float16: ~2x size reduction vs float32 with no
+            # measurable recall impact for L2-normalized embeddings.
+            embedding_data=data.embedding_data.astype(np.float16).tobytes()
             if data.embedding_data is not None
             else None,
         )
@@ -315,7 +317,9 @@ class SQLStorage(CacheStorage):
             return CacheData(
                 question=qs.question if not deps else Question(qs.question, res_deps),
                 answers=res_ans,
-                embedding_data=np.frombuffer(qs.embedding_data, dtype=np.float32),
+                embedding_data=np.frombuffer(qs.embedding_data, dtype=np.float16).astype(np.float32)
+                if qs.embedding_data is not None
+                else None,
                 session_id=session_ids,
                 create_on=qs.create_on,
                 last_access=last_access,

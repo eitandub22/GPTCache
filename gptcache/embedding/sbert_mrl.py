@@ -72,7 +72,9 @@ class SBERTMRL(BaseEmbedding):
         norms = np.linalg.norm(truncated, axis=1, keepdims=True)
         normalized = truncated / np.maximum(norms, 1e-9)
 
-        return np.array(normalized.squeeze(0)).astype("float32")
+        result = normalized.astype("float32")
+        # Return (dim,) for a single string, (N, dim) for a batch
+        return result.squeeze(0) if result.shape[0] == 1 else result
 
     @property
     def dimension(self):

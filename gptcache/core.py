@@ -87,19 +87,43 @@ class Cache:
                 if not os.getenv("IS_CI"):
                     gptcache_log.error(e)
 
-    def import_data(self, questions: List[Any], answers: List[Any], session_ids: Optional[List[Optional[str]]] = None) -> None:
+    def import_data(
+        self,
+        questions: List[Any],
+        answers: List[Any],
+        session_ids: Optional[List[Optional[str]]] = None,
+        batch_size: int = 1,
+    ) -> None:
         """Import data to GPTCache
 
         :param questions: preprocessed question Data
         :param answers: list of answers to questions
         :param session_ids: list of the session id.
+        :param batch_size: number of questions to embed in one call.
+            Values >1 pass a list to ``embedding_func`` and expect a 2-D
+            array back (shape ``[batch_size, dim]``), which is the case for
+            all embedders that accept list input (e.g. ``SBERTMRL``).
+            Defaults to 1 (original one-at-a-time behaviour).
+        :type batch_size: int
         :return: None
         """
+        if batch_size > 1:
+            embedding_datas = []
+            for i in range(0, len(questions), batch_size):
+                batch = questions[i : i + batch_size]
+                result = self.embedding_func(batch)
+                # batch call returns (N, dim); single call returns (dim,)
+                if hasattr(result, "ndim") and result.ndim == 2:
+                    embedding_datas.extend(result)
+                else:
+                    embedding_datas.append(result)
+        else:
+            embedding_datas = [self.embedding_func(question) for question in questions]
 
         self.data_manager.import_data(
             questions=questions,
             answers=answers,
-            embedding_datas=[self.embedding_func(question) for question in questions],
+            embedding_datas=embedding_datas,
             session_ids=session_ids if session_ids else [None for _ in range(len(questions))],
         )
 

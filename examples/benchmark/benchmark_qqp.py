@@ -32,6 +32,7 @@ NUM_INGEST = 10000       # Number of duplicate pairs to build the database from
 NUM_TP_TEST = 2000       # True-duplicate queries (goal: high hit rate)
 NUM_FP_TEST = 2000       # Non-duplicate queries (goal: low hit rate)
 SIMILARITY_THRESH = 0.90
+INGEST_BATCH_SIZE = 64   # Questions per embedding call during ingestion
 
 
 def create_encoder(mode):
@@ -186,10 +187,17 @@ def run(mode):
     dup_pairs = list(duplicates.select(range(NUM_INGEST)))
     db_questions = [pair["question1"] for pair in dup_pairs]
 
-    print(f"\nIngesting {len(db_questions)} questions...")
+    print(f"\nIngesting {len(db_questions)} questions (batch_size={INGEST_BATCH_SIZE})...")
     start_insert = time.time()
     dummy_answers = [f"Answer_{i}" for i in range(len(db_questions))]
-    cache.import_data(questions=db_questions, answers=dummy_answers)
+    for start in range(0, len(db_questions), INGEST_BATCH_SIZE):
+        batch_q = db_questions[start : start + INGEST_BATCH_SIZE]
+        batch_a = dummy_answers[start : start + INGEST_BATCH_SIZE]
+        cache.import_data(questions=batch_q, answers=batch_a, batch_size=INGEST_BATCH_SIZE)
+        done = min(start + INGEST_BATCH_SIZE, len(db_questions))
+        elapsed = time.time() - start_insert
+        print(f"  Ingested {done}/{len(db_questions)} "
+              f"({done / elapsed:.0f} vec/s)", flush=True)
     insert_time = time.time() - start_insert
     print(f"Ingestion complete in {insert_time:.2f}s "
           f"({len(db_questions)/insert_time:.0f} vectors/sec)")
