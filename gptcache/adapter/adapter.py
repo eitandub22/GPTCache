@@ -74,6 +74,21 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             pre_embedding_data, chat_cache.config.input_summary_len
         )
 
+    # Pre-embedding exact-match shortcut: hash the normalized query and return
+    # the cached answer if seen. Skips embedder + vector search for the heavy
+    # exact-repeat tail (canned prompts, agent self-talk, FAQs).
+    exact_match_cache = getattr(chat_cache, "exact_match_cache", None)
+    if (
+        cache_enable
+        and not cache_skip
+        and exact_match_cache is not None
+        and isinstance(pre_store_data, str)
+    ):
+        exact_hit = exact_match_cache.get(pre_store_data)
+        if exact_hit is not None:
+            chat_cache.report.hint_cache()
+            return cache_data_convert(exact_hit)
+
     if cache_enable:
         embedding_data = time_cal(
             chat_cache.embedding_func,
@@ -208,6 +223,10 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             )()
             if return_message is not None:
                 chat_cache.report.hint_cache()
+                # Populate the exact-match cache from a semantic hit so the
+                # next exact repeat skips embed + search entirely.
+                if exact_match_cache is not None and isinstance(pre_store_data, str):
+                    exact_match_cache.put(pre_store_data, return_message)
                 cache_whole_data = answers_dict.get(str(return_message))
                 if session and cache_whole_data:
                     chat_cache.data_manager.add_session(
@@ -271,6 +290,12 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
+                # Mirror the answer into the exact-match cache so the next
+                # identical query short-circuits before the embedder.
+                if exact_match_cache is not None and isinstance(pre_store_data, str):
+                    answer_string = _extract_answer_string(handled_llm_data)
+                    if answer_string is not None:
+                        exact_match_cache.put(pre_store_data, answer_string)
                 if (
                     chat_cache.report.op_save.count > 0
                     and chat_cache.report.op_save.count % chat_cache.config.auto_flush
@@ -351,6 +376,21 @@ async def aadapt(
         pre_embedding_data = _summarize_input(
             pre_embedding_data, chat_cache.config.input_summary_len
         )
+
+    # Pre-embedding exact-match shortcut: hash the normalized query and return
+    # the cached answer if seen. Skips embedder + vector search for the heavy
+    # exact-repeat tail (canned prompts, agent self-talk, FAQs).
+    exact_match_cache = getattr(chat_cache, "exact_match_cache", None)
+    if (
+        cache_enable
+        and not cache_skip
+        and exact_match_cache is not None
+        and isinstance(pre_store_data, str)
+    ):
+        exact_hit = exact_match_cache.get(pre_store_data)
+        if exact_hit is not None:
+            chat_cache.report.hint_cache()
+            return cache_data_convert(exact_hit)
 
     if cache_enable:
         embedding_data = time_cal(
@@ -471,6 +511,10 @@ async def aadapt(
             )()
             if return_message is not None:
                 chat_cache.report.hint_cache()
+                # Populate the exact-match cache from a semantic hit so the
+                # next exact repeat skips embed + search entirely.
+                if exact_match_cache is not None and isinstance(pre_store_data, str):
+                    exact_match_cache.put(pre_store_data, return_message)
                 cache_whole_data = answers_dict.get(str(return_message))
                 if session and cache_whole_data:
                     chat_cache.data_manager.add_session(
@@ -526,6 +570,12 @@ async def aadapt(
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
+                # Mirror the answer into the exact-match cache so the next
+                # identical query short-circuits before the embedder.
+                if exact_match_cache is not None and isinstance(pre_store_data, str):
+                    answer_string = _extract_answer_string(handled_llm_data)
+                    if answer_string is not None:
+                        exact_match_cache.put(pre_store_data, answer_string)
                 if (
                     chat_cache.report.op_save.count > 0
                     and chat_cache.report.op_save.count % chat_cache.config.auto_flush
@@ -538,6 +588,27 @@ async def aadapt(
         except Exception:  # pylint: disable=W0703
             gptcache_log.error("failed to save the data to cache", exc_info=True)
     return llm_data
+
+
+def _extract_answer_string(handled_llm_data):
+    """Pull a string out of whatever update_cache_callback passes us.
+
+    Adapters wrap the LLM answer in many shapes - a raw ``str``, an
+    ``Answer(str, DataType)``, a list of ``Answer``s, etc. The semantic
+    layer stores ``Answer.answer`` (a str), so we mirror that here so the
+    next exact-match lookup returns a string compatible with
+    ``cache_data_convert``.
+    """
+    if handled_llm_data is None:
+        return None
+    if isinstance(handled_llm_data, str):
+        return handled_llm_data
+    answer_attr = getattr(handled_llm_data, "answer", None)
+    if isinstance(answer_attr, str):
+        return answer_attr
+    if isinstance(handled_llm_data, list) and handled_llm_data:
+        return _extract_answer_string(handled_llm_data[0])
+    return None
 
 
 _input_summarizer = None

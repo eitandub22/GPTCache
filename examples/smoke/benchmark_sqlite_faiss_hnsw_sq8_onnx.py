@@ -1,3 +1,8 @@
+# SMOKE TEST - not a benchmark.
+# Drives openai.ChatCompletion; the measured "time" is dominated by network
+# round-trips and is not meaningful for GPTCache performance work.
+# Use examples/benchmark/benchmark_qqp.py for memory and search-speed numbers.
+
 import json
 import os
 import time

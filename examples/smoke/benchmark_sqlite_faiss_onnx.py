@@ -1,12 +1,7 @@
-"""Benchmark: MRL-truncated SBERT + FAISS HNSW+SQ8
-
-This benchmark measures the full MRL optimization pipeline:
-  Embedding (nomic-embed-text-v1.5) → MRL Truncation (768→256) → SQ8 → HNSW
-
-Compare results against:
-  - benchmark_sqlite_faiss_onnx.py         (Flat, 768d, float32)
-  - benchmark_sqlite_faiss_hnsw_sq8_onnx.py (HNSW+SQ8, 768d, uint8)
-"""
+# SMOKE TEST - not a benchmark.
+# Drives openai.ChatCompletion; the measured "time" is dominated by network
+# round-trips and is not meaningful for GPTCache performance work.
+# Use examples/benchmark/benchmark_qqp.py for memory and search-speed numbers.
 
 import json
 import os
@@ -15,24 +10,36 @@ import time
 from gptcache.adapter import openai
 from gptcache import cache, Config
 from gptcache.manager import get_data_manager, CacheBase, VectorBase
-from gptcache.embedding import SBERTMRL
+from gptcache.similarity_evaluation.onnx import OnnxModelEvaluation
+from gptcache.embedding import Onnx as EmbeddingOnnx
 from gptcache.similarity_evaluation.distance import SearchDistanceEvaluation
-
-
-TARGET_DIM = 256
 
 
 def run():
     with open("mock_data.json", "r") as mock_file:
         mock_data = json.load(mock_file)
 
-    # MRL-enabled embedding model with truncation to TARGET_DIM
-    embedding_mrl = SBERTMRL(
-        model="nomic-ai/nomic-embed-text-v1.5",
-        target_dim=TARGET_DIM,
-    )
-    print(f"Embedding model: nomic-embed-text-v1.5 (MRL truncated to {TARGET_DIM}d)")
-    print(f"Reported dimension: {embedding_mrl.dimension}")
+    embedding_onnx = EmbeddingOnnx()
+
+    # if you want more accurate results,
+    # you can use onnx's results to evaluate the model,
+    # it will make the results more accurate, but the cache hit rate will decrease
+
+    # evaluation_onnx = EvaluationOnnx()
+    # class WrapEvaluation(SearchDistanceEvaluation):
+    #
+    #     def __init__(self):
+    #         self.evaluation_onnx = EvaluationOnnx()
+    #
+    #     def evaluation(self, src_dict, cache_dict, **kwargs):
+    #         rank1 = super().evaluation(src_dict, cache_dict, **kwargs)
+    #         if rank1 <= 0.5:
+    #             rank2 = evaluation_onnx.evaluation(src_dict, cache_dict, **kwargs)
+    #             return rank2 if rank2 != 0 else 1
+    #         return 0
+    #
+    #     def range(self):
+    #         return 0.0, 1.0
 
     class WrapEvaluation(SearchDistanceEvaluation):
         def evaluation(self, src_dict, cache_dict, **kwargs):
@@ -46,14 +53,10 @@ def run():
     has_data = os.path.isfile(sqlite_file) and os.path.isfile(faiss_file)
 
     cache_base = CacheBase("sqlite")
-    vector_base = VectorBase(
-        "faiss",
-        dimension=TARGET_DIM,
-        index_type="hnsw_sq8",
-    )
+    vector_base = VectorBase("faiss", dimension=embedding_onnx.dimension)
     data_manager = get_data_manager(cache_base, vector_base, max_size=100000)
     cache.init(
-        embedding_func=embedding_mrl.to_embeddings,
+        embedding_func=embedding_onnx.to_embeddings,
         data_manager=data_manager,
         similarity_evaluation=WrapEvaluation(),
         config=Config(similarity_threshold=0.95),
@@ -101,9 +104,6 @@ def run():
             print(f"OpenAI API Error: {e}")
             fail_count += 1
 
-    print("\n" + "=" * 60)
-    print(f"MRL + HNSW+SQ8 Benchmark Results (dim={TARGET_DIM})")
-    print("=" * 60)
     print("average time: {:.2f}s".format(all_time / len(mock_data)))
     print("cache_hint_positive:", hit_cache_positive)
     print("hit_cache_negative:", hit_cache_negative)
@@ -126,11 +126,6 @@ def run():
             print(f"  {filepath}: {size_str} ({size_bytes:,} bytes)")
         else:
             print(f"  {filepath}: FILE NOT FOUND!")
-    # Also check for tombstone file
-    tombstone_file = faiss_file + ".tombstones.npy"
-    if os.path.isfile(tombstone_file):
-        size_bytes = os.path.getsize(tombstone_file)
-        print(f"  {tombstone_file}: {size_bytes:,} bytes")
 
 
 if __name__ == "__main__":

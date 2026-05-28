@@ -143,3 +143,6 @@ docs/references/*
 CLAUDE.md
 .claude/*
 .env
+
+docs
+onnx_dynamic

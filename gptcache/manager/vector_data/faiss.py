@@ -52,7 +52,9 @@ class Faiss(VectorBase):
         index_type="flat",
         hnsw_m=32,
         hnsw_ef_construction=200,
-        hnsw_ef_search=128,
+        # Default lowered from 128 -> 64 in Step 5 of docs/memory-speed-plan.md.
+        # ef can be overridden per call via search(ef_search=...).
+        hnsw_ef_search=64,
     ):
         self._index_file_path = index_file_path
         self._dimension = dimension
@@ -138,7 +140,16 @@ class Faiss(VectorBase):
 
         self._index.add_with_ids(np_data, ids)
 
-    def search(self, data: np.ndarray, top_k: int = -1):
+    def search(self, data: np.ndarray, top_k: int = -1, ef_search: int = None):
+        """Search the index for the top-k nearest neighbours.
+
+        :param data: query vector.
+        :param top_k: how many neighbours to return; ``-1`` uses the configured default.
+        :param ef_search: HNSW per-call ``efSearch`` override. Higher = more
+            candidates explored = better recall at higher latency. Only meaningful
+            for ``hnsw_sq8``; ignored for ``flat``. ``None`` keeps the index-level
+            default set at construction time.
+        """
         if self._index.ntotal == 0:
             return None
         if top_k == -1:
@@ -146,24 +157,42 @@ class Faiss(VectorBase):
 
         np_data = np.array(data).astype("float32").reshape(1, -1)
 
-        if self._index_type == "hnsw_sq8" and self._tombstones:
-            # Over-fetch to compensate for tombstoned results we'll filter out
-            fetch_k = min(top_k + len(self._tombstones), self._index.ntotal)
-            dist, ids = self._index.search(np_data, fetch_k)
-            # Filter out tombstoned IDs
-            results = []
-            for d, i in zip(dist[0], ids[0]):
-                i = int(i)
-                if i == -1 or i in self._tombstones:
-                    continue
-                results.append((d, i))
-                if len(results) >= top_k:
-                    break
-            return results if results else None
-        else:
-            dist, ids = self._index.search(np_data, top_k)
-            ids = [int(i) for i in ids[0]]
-            return list(zip(dist[0], ids))
+        # Per-call efSearch override - the cheapest knob in HNSW. Restore the
+        # default after the call so concurrent searches with different settings
+        # don't poison each other.
+        hnsw = None
+        prior_ef = None
+        if self._index_type == "hnsw_sq8" and ef_search is not None:
+            try:
+                inner = faiss.downcast_index(self._index.index)  # unwrap IndexIDMap
+                hnsw = inner.hnsw
+                prior_ef = hnsw.efSearch
+                hnsw.efSearch = int(ef_search)
+            except Exception:  # noqa: BLE001
+                hnsw = None  # silently fall back to the index-level default
+
+        try:
+            if self._index_type == "hnsw_sq8" and self._tombstones:
+                # Over-fetch to compensate for tombstoned results we'll filter out
+                fetch_k = min(top_k + len(self._tombstones), self._index.ntotal)
+                dist, ids = self._index.search(np_data, fetch_k)
+                # Filter out tombstoned IDs
+                results = []
+                for d, i in zip(dist[0], ids[0]):
+                    i = int(i)
+                    if i == -1 or i in self._tombstones:
+                        continue
+                    results.append((d, i))
+                    if len(results) >= top_k:
+                        break
+                return results if results else None
+            else:
+                dist, ids = self._index.search(np_data, top_k)
+                ids = [int(i) for i in ids[0]]
+                return list(zip(dist[0], ids))
+        finally:
+            if hnsw is not None and prior_ef is not None:
+                hnsw.efSearch = prior_ef
 
     def rebuild(self, ids=None):
         """Rebuild the index, removing physically deleted vectors where possible.

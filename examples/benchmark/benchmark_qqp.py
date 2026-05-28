@@ -1,241 +1,720 @@
-"""GPTCache QQP Benchmark
+"""GPTCache QQP Benchmark (4-cell isolation matrix)
 
-Evaluates cache accuracy and performance using the Quora Question Pairs dataset.
-Runs two configurations for comparison:
-  1. Baseline: ONNX (768d) + Flat FAISS index
-  2. Optimized: MRL (256d) + HNSW+SQ8 FAISS index
+Implements BP1-BP6 from docs/memory-speed-plan.md:
 
-Metrics: True Positive rate (should hit), False Positive rate (should NOT hit),
-         latency percentiles, throughput, storage size.
+  BP1 - 4-cell encoder x index matrix:
+        A: ONNX 768d + Flat        (true baseline - what users have today)
+        B: ONNX 768d + HNSW+SQ8    (isolates the index change)
+        C: MRL  256d + Flat        (isolates the encoder change)
+        D: MRL  256d + HNSW+SQ8    (combined - current optimised config)
+  BP2 - Pure search latency reported separately from end-to-end.
+  BP3 - Index-only RAM via faiss.serialize_index; on-disk via os.path.getsize.
+        These are reported as two distinct columns - different problems.
+  BP4 - Configurable scale (--scale 10000 / 100000 / 1000000).
+  BP5 - Warmup, repeats (median + IQR), explicit thread pinning,
+        p50/p90/p95/p99 distributions.
+  BP6 - Old OpenAI-driven scripts moved to examples/smoke/ (see that folder).
 
-Usage:
-  python benchmark_qqp.py --mode baseline
-  python benchmark_qqp.py --mode optimized
+This harness is encoder-agnostic. If a real encoder (ONNX, sentence-transformers)
+is not installed, that cell is SKIPPED with a clear message; the other cells
+continue. A `--encoder synthetic` mode is also provided for fast harness
+verification without any model downloads.
+
+Usage
+-----
+  # Quick sanity run, synthetic encoder, 10K vectors:
+  python benchmark_qqp.py --scale 10000 --encoder synthetic --repeats 1
+
+  # Real run (requires sentence-transformers, transformers, onnxruntime,
+  # datasets):
+  python benchmark_qqp.py --scale 10000 --encoder auto --repeats 3
+  python benchmark_qqp.py --scale 100000 --encoder auto --repeats 3
+  python benchmark_qqp.py --scale 1000000 --encoder auto --repeats 3
+
+Output
+------
+The harness prints a results table for the four cells and writes a JSON
+artifact next to it (one row per cell, including memory + percentiles)
+that downstream tooling (or docs/steps-1-5-results.md) can diff against.
 """
 
 import argparse
+import hashlib
+import importlib
+import json
 import os
 import shutil
+import sys
 import time
+from contextlib import contextmanager
 
 import numpy as np
-import psutil
-from datasets import load_dataset
 
-from gptcache import cache, Config
-from gptcache.manager import get_data_manager, CacheBase, VectorBase
-from gptcache.similarity_evaluation.distance import SearchDistanceEvaluation
-from gptcache.embedding.sbert_mrl import SBERTMRL
-
-# --- Configuration ---
-NUM_INGEST = 10000       # Number of duplicate pairs to build the database from
-NUM_TP_TEST = 2000       # True-duplicate queries (goal: high hit rate)
-NUM_FP_TEST = 2000       # Non-duplicate queries (goal: low hit rate)
-SIMILARITY_THRESH = 0.90
-INGEST_BATCH_SIZE = 64   # Questions per embedding call during ingestion
+# ---------------------------------------------------------------------------
+# Thread pinning - MUST happen before numpy/torch heavy imports for OMP_NUM_THREADS
+# to take effect. We re-pin via faiss.omp_set_num_threads() later as well.
+# ---------------------------------------------------------------------------
+def _set_thread_env_early(n):
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, str(n))
 
 
-def create_encoder(mode):
-    """Create the embedding encoder for the given mode."""
-    if mode == "baseline":
-        # Baseline uses the full 768 dimensions
-        return SBERTMRL(target_dim=768)
-    else:
-        # Optimized uses MRL 256 dimensions
-        return SBERTMRL(target_dim=256)
+_DEFAULT_THREADS = int(os.environ.get("GPTCACHE_FAISS_THREADS", "1"))
+_set_thread_env_early(_DEFAULT_THREADS)
+
+import faiss  # noqa: E402  - import after env pin
+
+from gptcache import cache, Config  # noqa: E402
+from gptcache.manager import CacheBase, VectorBase, get_data_manager  # noqa: E402
+from gptcache.similarity_evaluation.distance import SearchDistanceEvaluation  # noqa: E402
 
 
-def setup_cache(mode, work_dir):
-    """Initialize GPTCache with the appropriate configuration.
+# ---------------------------------------------------------------------------
+# Encoders
+# ---------------------------------------------------------------------------
 
-    Returns (encoder, data_manager, faiss_path, sqlite_path).
+class _BaseEncoder:
+    dimension = 0
+    label = "?"
+
+    def to_embeddings(self, data, **_):
+        raise NotImplementedError
+
+
+class SyntheticEncoder(_BaseEncoder):
+    """Deterministic hash-based pseudo-embedding for harness verification.
+
+    Same string -> same vector. To make the harness produce realistic
+    non-zero TP / FP rates without any model download, the encoder
+    recognises the synthetic dataset's naming convention:
+
+      "topic_<N>"               -> seed N (base vector)
+      "topic_<N>_paraphrase"    -> seed N + 0.05 * noise (TP variant - near)
+      "<anything else>"         -> full-text hash (FP variant - far)
+
+    For real encoders this lookup path is dead code.
     """
-    os.makedirs(work_dir, exist_ok=True)
-    encoder = create_encoder(mode)
-    dim = encoder.dimension
 
+    _PARAPHRASE_SUFFIX = "_paraphrase"
+
+    def __init__(self, dim, paraphrase_noise=0.05):
+        self.dimension = dim
+        self.label = f"synthetic-{dim}d"
+        self._paraphrase_noise = paraphrase_noise
+
+    def _topic_seed(self, text):
+        # Try to extract "topic_<N>" prefix; return (seed, is_paraphrase)
+        if text.startswith("topic_"):
+            stripped = text
+            is_para = False
+            if stripped.endswith(self._PARAPHRASE_SUFFIX):
+                stripped = stripped[: -len(self._PARAPHRASE_SUFFIX)]
+                is_para = True
+            tail = stripped[len("topic_"):]
+            try:
+                return int(tail), is_para
+            except ValueError:
+                return None, False
+        return None, False
+
+    def _vec(self, text):
+        seed, is_para = self._topic_seed(text)
+        if seed is None:
+            seed = int.from_bytes(
+                hashlib.blake2s(text.encode("utf-8"), digest_size=8).digest(), "little"
+            )
+            is_para = False
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(self.dimension).astype(np.float32)
+        if is_para:
+            noise_rng = np.random.default_rng(seed ^ 0x9E3779B97F4A7C15)
+            v = v + self._paraphrase_noise * noise_rng.standard_normal(self.dimension).astype(np.float32)
+        v /= max(np.linalg.norm(v), 1e-9)
+        return v
+
+    def to_embeddings(self, data, **_):
+        if isinstance(data, list):
+            return np.stack([self._vec(d) for d in data])
+        return self._vec(data)
+
+
+def _try_import_onnx_encoder():
+    try:
+        from gptcache.embedding import Onnx
+        return Onnx
+    except ImportError:
+        return None
+
+
+def _try_import_mrl_encoder():
+    try:
+        from gptcache.embedding import SBERTMRL
+        return SBERTMRL
+    except ImportError:
+        return None
+
+
+class _SBERT768Encoder(_BaseEncoder):
+    """PyTorch SentenceTransformer wrapper producing 768-d embeddings.
+
+    Uses the same underlying model as the ONNX encoder
+    (paraphrase-albert-small-v2) but runs in native PyTorch, which
+    supports true batching.  This is ~30x faster than the static-batch-1
+    ONNX model for ingest, at the cost of not using ONNX Runtime.
+    """
+
+    def __init__(self):
+        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+        self._model = SentenceTransformer("paraphrase-albert-small-v2")
+        self._model.eval()
+        self.dimension = self._model.get_sentence_embedding_dimension()
+        self.label = f"sbert768-{self.dimension}d"
+
+    def to_embeddings(self, data, **_):
+        import numpy as np  # noqa: PLC0415
+        if isinstance(data, str):
+            data = [data]
+        emb = self._model.encode(data, batch_size=64, show_progress_bar=False)
+        result = np.array(emb).astype("float32")
+        return result.squeeze(0) if result.shape[0] == 1 else result
+
+
+def make_encoder(kind, *, dim=None, onnx_fallback=True):
+    """Build the encoder for a cell. Returns None if its deps aren't available.
+
+    kind in {"onnx", "mrl", "synthetic"}.
+    onnx_fallback: if True, fall back to the PyTorch SBERT-768 encoder when
+                   the ONNX model is unavailable (e.g. no dynamic-batch export).
+    """
+    if kind == "synthetic":
+        assert dim is not None
+        return SyntheticEncoder(dim)
+    if kind == "onnx":
+        Onnx = _try_import_onnx_encoder()
+        if Onnx is None:
+            return None
+        try:
+            enc = Onnx()
+            # Check if the loaded ONNX model supports dynamic batching.
+            # The original GPTCache model was exported with static batch_size=1,
+            # making it ~30-100x slower than a batched PyTorch encoder.
+            # Fall back to SBERT-768 unless a dynamic-batch model was provided.
+            if onnx_fallback and not getattr(enc, "_dynamic_batch", True):
+                print("  [fallback] ONNX model has static batch_size=1 — "
+                      "falling back to PyTorch SentenceTransformer 768d (true batching).")
+                print("  [tip] Run scripts/export_onnx_dynamic.py and set "
+                      "GPTCACHE_ONNX_MODEL_DIR to use a fast dynamic-batch ONNX model.")
+                try:
+                    return _SBERT768Encoder()
+                except Exception as fe:  # noqa: BLE001
+                    print(f"  [skip] sbert768 fallback also failed: {fe}")
+                    return None
+            enc.label = f"onnx-{enc.dimension}d"
+            return enc
+        except Exception as e:  # noqa: BLE001
+            if onnx_fallback:
+                print(f"  [fallback] ONNX unavailable ({e})")
+                print("  [fallback] Using PyTorch SentenceTransformer 768d instead (supports batching).")
+                try:
+                    return _SBERT768Encoder()
+                except Exception as fe:  # noqa: BLE001
+                    print(f"  [skip] sbert768 fallback also failed: {fe}")
+                    return None
+            print(f"  [skip] onnx encoder unavailable: {e}")
+            return None
+    if kind == "mrl":
+        SBERTMRL = _try_import_mrl_encoder()
+        if SBERTMRL is None:
+            return None
+        try:
+            enc = SBERTMRL(target_dim=256)
+            enc.label = f"mrl-{enc.dimension}d"
+            return enc
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] MRL encoder unavailable: {e}")
+            return None
+    raise ValueError(f"unknown encoder kind: {kind}")
+
+
+# ---------------------------------------------------------------------------
+# Data sources
+# ---------------------------------------------------------------------------
+
+def _try_load_qqp(n_ingest, n_tp, n_fp):
+    """Return (db_questions, tp_queries, fp_queries) or None if datasets is missing."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        return None
+    ds = load_dataset("glue", "qqp", split="train")
+    dup = ds.filter(lambda x: x["label"] == 1)
+    non = ds.filter(lambda x: x["label"] == 0)
+    # If the caller asks for more than the dataset can supply, fall back to
+    # what's available rather than crashing.
+    n_ingest = min(n_ingest, len(dup))
+    n_tp = min(n_tp, n_ingest)
+    n_fp = min(n_fp, len(non))
+    dup_pairs = list(dup.select(range(n_ingest)))
+    non_pairs = list(non.select(range(n_fp)))
+    db_questions = [p["question1"] for p in dup_pairs]
+    tp_queries = [p["question2"] for p in dup_pairs[:n_tp]]
+    fp_queries = [p["question2"] for p in non_pairs]
+    return db_questions, tp_queries, fp_queries
+
+
+def _synthetic_dataset(n_ingest, n_tp, n_fp, seed=0):
+    """Deterministic question-pair generator for harness sanity runs.
+
+    Uses the "topic_<N>" naming convention that SyntheticEncoder
+    recognises, so TP queries land near their ingested originals in
+    vector space and FP queries land far away.
+    """
+    db_questions = [f"topic_{i}" for i in range(n_ingest)]
+    tp_queries = [f"topic_{i}{SyntheticEncoder._PARAPHRASE_SUFFIX}"
+                  for i in range(min(n_tp, n_ingest))]
+    # Use seeds well outside the ingested range so FP vectors are uncorrelated.
+    fp_queries = [f"topic_{seed + n_ingest + 10_000_000 + i}" for i in range(n_fp)]
+    return db_questions, tp_queries, fp_queries
+
+
+def load_dataset_or_synthesise(prefer_qqp, n_ingest, n_tp, n_fp):
+    if prefer_qqp:
+        loaded = _try_load_qqp(n_ingest, n_tp, n_fp)
+        if loaded is not None:
+            return loaded, "qqp"
+        print("  [data] HuggingFace `datasets` not installed - falling back to synthetic pairs")
+    return _synthetic_dataset(n_ingest, n_tp, n_fp), "synthetic"
+
+
+# ---------------------------------------------------------------------------
+# Cache setup per cell
+# ---------------------------------------------------------------------------
+
+def setup_cell(encoder, index_kind, work_dir, similarity_threshold, max_size):
+    """Initialise a fresh GPTCache for a cell. Returns (data_manager, faiss_path, sqlite_path)."""
+    shutil.rmtree(work_dir, ignore_errors=True)
+    os.makedirs(work_dir, exist_ok=True)
     sqlite_path = os.path.join(work_dir, "sqlite.db")
     faiss_path = os.path.join(work_dir, "faiss.index")
 
     cache_base = CacheBase("sqlite", sql_url=f"sqlite:///{sqlite_path}")
-
-    if mode == "baseline":
-        vector_base = VectorBase("faiss", dimension=dim, index_path=faiss_path)
-        config_label = f"Flat index, {dim}d float32"
-    else:
+    if index_kind == "flat":
+        vector_base = VectorBase("faiss", dimension=encoder.dimension, index_path=faiss_path)
+    elif index_kind == "hnsw_sq8":
         vector_base = VectorBase(
-            "faiss", dimension=dim, index_path=faiss_path, index_type="hnsw_sq8"
+            "faiss", dimension=encoder.dimension, index_path=faiss_path, index_type="hnsw_sq8"
         )
-        config_label = f"HNSW+SQ8 index, {dim}d uint8"
+    else:
+        raise ValueError(f"unknown index_kind: {index_kind}")
 
-    data_manager = get_data_manager(cache_base, vector_base, max_size=200000)
-
+    data_manager = get_data_manager(cache_base, vector_base, max_size=max_size)
     cache.init(
         embedding_func=encoder.to_embeddings,
         data_manager=data_manager,
         similarity_evaluation=SearchDistanceEvaluation(),
-        config=Config(similarity_threshold=SIMILARITY_THRESH),
+        config=Config(similarity_threshold=similarity_threshold),
+    )
+    return data_manager, faiss_path, sqlite_path
+
+
+def ingest(encoder, db_questions, batch_size=64):
+    """Time the ingest path. Returns total seconds."""
+    dummy_answers = [f"a_{i}" for i in range(len(db_questions))]
+    t0 = time.perf_counter()
+    for start in range(0, len(db_questions), batch_size):
+        bq = db_questions[start:start + batch_size]
+        ba = dummy_answers[start:start + batch_size]
+        cache.import_data(questions=bq, answers=ba, batch_size=batch_size)
+    return time.perf_counter() - t0
+
+
+# ---------------------------------------------------------------------------
+# Measurement
+# ---------------------------------------------------------------------------
+
+def measure_cell(encoder, data_manager, tp_queries, fp_queries,
+                 similarity_threshold, warmup, repeats, top_k=1):
+    """Run TP + FP query sets with warmup and repeats.
+
+    Returns dict with:
+      - tp_hit_rate, fp_hit_rate
+      - search_latency_ms: dict with p50, p90, p95, p99 (pooled across repeats)
+      - e2e_latency_ms:    dict with p50, p90, p95, p99
+      - per_repeat: list of dicts with the same percentile keys
+    """
+    evaluator = cache.similarity_evaluation
+    min_r, max_r = evaluator.range()
+    rank_threshold = (max_r - min_r) * similarity_threshold
+
+    all_queries = list(tp_queries) + list(fp_queries)
+    is_tp = [True] * len(tp_queries) + [False] * len(fp_queries)
+
+    # --- Warmup (results discarded) ---
+    for q in all_queries[:warmup]:
+        e = encoder.to_embeddings(q)
+        _ = data_manager.search(e)
+
+    pooled_search = []
+    pooled_e2e = []
+    per_repeat = []
+
+    for rep in range(repeats):
+        search_ms = []
+        e2e_ms = []
+        tp_hits = 0
+        fp_hits = 0
+        for q, tp in zip(all_queries, is_tp):
+            # End-to-end timer: embed + search + evaluate
+            t0 = time.perf_counter()
+            emb = encoder.to_embeddings(q)
+            # BP2 - pure search measurement: time search() in isolation
+            ts0 = time.perf_counter()
+            res = data_manager.search(emb)
+            ts1 = time.perf_counter()
+            search_ms.append((ts1 - ts0) * 1000.0)
+
+            hit = False
+            if res:
+                distance, cid = res[0]
+                score = evaluator.evaluation({}, {"search_result": (distance, cid)})
+                if score >= rank_threshold:
+                    hit = True
+            t1 = time.perf_counter()
+            e2e_ms.append((t1 - t0) * 1000.0)
+            if tp and hit:
+                tp_hits += 1
+            elif (not tp) and hit:
+                fp_hits += 1
+
+        pooled_search.extend(search_ms)
+        pooled_e2e.extend(e2e_ms)
+        per_repeat.append({
+            "search_ms": _percentiles(search_ms),
+            "e2e_ms": _percentiles(e2e_ms),
+            "tp_hits": tp_hits,
+            "fp_hits": fp_hits,
+        })
+
+    return {
+        "tp_hit_rate": per_repeat[-1]["tp_hits"] / max(len(tp_queries), 1),
+        "fp_hit_rate": per_repeat[-1]["fp_hits"] / max(len(fp_queries), 1),
+        "search_latency_ms": _percentiles(pooled_search),
+        "e2e_latency_ms": _percentiles(pooled_e2e),
+        "per_repeat": per_repeat,
+    }
+
+
+def _percentiles(values):
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return {"p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0,
+                "iqr": 0.0, "n": 0}
+    p25, p50, p75, p90, p95, p99 = np.percentile(arr, [25, 50, 75, 90, 95, 99])
+    return {
+        "p50": float(p50),
+        "p90": float(p90),
+        "p95": float(p95),
+        "p99": float(p99),
+        "mean": float(arr.mean()),
+        "iqr": float(p75 - p25),
+        "n": int(arr.size),
+    }
+
+
+def measure_exact_match_shortcut(encoder, data_manager, repeat_queries, warmup, repeats):
+    """Compare time-to-answer for an exact-repeat query through:
+       (a) embed + search (the path BEFORE Step 4)
+       (b) exact_match_cache.get (the Step 4 shortcut)
+
+    The exact-match cache is populated up front with the same queries so
+    every lookup is a guaranteed hit.
+
+    Returns dict with shortcut_ms (Step 4 path) and baseline_ms (without).
+    """
+    from gptcache import cache as global_cache  # local import to avoid name collision
+    emc = getattr(global_cache, "exact_match_cache", None)
+    if emc is None:
+        return None
+    # Populate the shortcut cache
+    emc.clear()
+    for q in repeat_queries:
+        emc.put(q, f"cached_answer_for::{q}")
+
+    # Warmup
+    for q in repeat_queries[:warmup]:
+        _ = encoder.to_embeddings(q)
+        _ = data_manager.search(_)
+        _ = emc.get(q)
+
+    baseline_ms = []
+    shortcut_ms = []
+    for _ in range(repeats):
+        for q in repeat_queries:
+            t0 = time.perf_counter()
+            e = encoder.to_embeddings(q)
+            _ = data_manager.search(e)
+            t1 = time.perf_counter()
+            baseline_ms.append((t1 - t0) * 1000.0)
+
+            t0 = time.perf_counter()
+            _ = emc.get(q)
+            t1 = time.perf_counter()
+            shortcut_ms.append((t1 - t0) * 1000.0)
+
+    return {
+        "baseline_ms": _percentiles(baseline_ms),
+        "shortcut_ms": _percentiles(shortcut_ms),
+        "exact_match_hits": emc.hits,
+        "exact_match_misses": emc.misses,
+    }
+
+
+def measure_memory(data_manager, faiss_path, sqlite_path):
+    """BP3 - index-only RAM via faiss.serialize_index + on-disk sizes."""
+    # The underlying vector store inside SSDataManager is exposed as .v
+    vector_store = data_manager.v
+    faiss_index = getattr(vector_store, "_index", None)
+    ram_bytes = 0
+    if faiss_index is not None:
+        try:
+            ram_bytes = int(len(faiss.serialize_index(faiss.downcast_index(faiss_index))))
+        except Exception:  # noqa: BLE001
+            # downcast_index may raise on IndexIDMap wrappers; serialize the wrapper instead
+            try:
+                ram_bytes = int(len(faiss.serialize_index(faiss_index)))
+            except Exception:  # noqa: BLE001
+                ram_bytes = 0
+    faiss_disk = os.path.getsize(faiss_path) if os.path.isfile(faiss_path) else 0
+    sqlite_disk = os.path.getsize(sqlite_path) if os.path.isfile(sqlite_path) else 0
+    return {
+        "faiss_ram_bytes": ram_bytes,
+        "faiss_disk_bytes": int(faiss_disk),
+        "sqlite_disk_bytes": int(sqlite_disk),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cell driver
+# ---------------------------------------------------------------------------
+
+CELLS = [
+    {"name": "A", "label": "ONNX/768/Flat",     "encoder": "onnx",      "index": "flat"},
+    {"name": "B", "label": "ONNX/768/HNSW+SQ8", "encoder": "onnx",      "index": "hnsw_sq8"},
+    {"name": "C", "label": "MRL/256/Flat",      "encoder": "mrl",       "index": "flat"},
+    {"name": "D", "label": "MRL/256/HNSW+SQ8", "encoder": "mrl",       "index": "hnsw_sq8"},
+]
+
+
+def run_cell(spec, data, args, threads):
+    name = spec["name"]
+    print(f"\n=== Cell {name} - {spec['label']} ===")
+
+    encoder_kind = spec["encoder"]
+    if args.encoder == "synthetic":
+        # Force-synthetic regardless of cell - useful for harness sanity runs.
+        # Pick the dim that matches the cell's logical encoder.
+        encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else 256)
+    else:
+        onnx_fallback = not getattr(args, "no_onnx_fallback", False)
+        encoder = make_encoder(encoder_kind, onnx_fallback=onnx_fallback)
+        if encoder is None:
+            print(f"  [skip] cell {name}: encoder '{encoder_kind}' unavailable. "
+                  f"Install its deps to run this cell.")
+            return None
+
+    work_dir = os.path.join(args.workdir, f"cell_{name}")
+    data_manager, faiss_path, sqlite_path = setup_cell(
+        encoder=encoder,
+        index_kind=spec["index"],
+        work_dir=work_dir,
+        similarity_threshold=args.threshold,
+        max_size=max(args.scale * 2, 100_000),
     )
 
-    print(f"  Encoder   : {encoder.__class__.__name__} (dim={dim})")
-    print(f"  Index     : {config_label}")
-    print(f"  Threshold : {SIMILARITY_THRESH}")
+    db_q, tp_q, fp_q = data
+    print(f"  Encoder      : {encoder.label}")
+    print(f"  Index        : {spec['index']}")
+    print(f"  Threads      : {threads}")
+    print(f"  Ingest size  : {len(db_q)}")
+    print(f"  TP queries   : {len(tp_q)}")
+    print(f"  FP queries   : {len(fp_q)}")
 
-    return encoder, data_manager, faiss_path, sqlite_path
+    ingest_s = ingest(encoder, db_q, batch_size=args.ingest_batch)
+    print(f"  Ingest time  : {ingest_s:.2f}s ({len(db_q)/max(ingest_s,1e-9):.0f} vec/s)")
 
+    metrics = measure_cell(
+        encoder=encoder,
+        data_manager=data_manager,
+        tp_queries=tp_q,
+        fp_queries=fp_q,
+        similarity_threshold=args.threshold,
+        warmup=args.warmup,
+        repeats=args.repeats,
+    )
 
-def query_cache_direct(query_text, encoder, data_manager):
-    """Perform a single cache lookup using the internal pipeline.
+    # Optional: exercise the Step 4 exact-match shortcut on a slice of the
+    # TP query set. Only meaningful on cell D (the production config),
+    # but we measure on any cell - the lever is encoder/index agnostic.
+    exact_match_metrics = None
+    if args.exact_repeat_frac > 0.0:
+        n_repeat = max(int(len(tp_q) * args.exact_repeat_frac), 1)
+        repeat_queries = list(tp_q[:n_repeat])
+        exact_match_metrics = measure_exact_match_shortcut(
+            encoder=encoder,
+            data_manager=data_manager,
+            repeat_queries=repeat_queries,
+            warmup=min(args.warmup, n_repeat),
+            repeats=args.repeats,
+        )
 
-    GPTCache has no public `cache.get()` API — queries normally go through
-    the OpenAI adapter. For benchmarking we call the pipeline directly:
-      embed → search → evaluate threshold
-
-    Returns (is_hit: bool, latency_seconds: float).
-    """
-    start = time.time()
-
-    # 1. Embed the query
-    embedding = encoder.to_embeddings(query_text)
-
-    # 2. Search (data_manager.search normalizes the vector internally)
-    search_results = data_manager.search(embedding)
-
-    is_hit = False
-    if search_results:
-        distance, cache_id = search_results[0]  # best match
-
-        # 3. Evaluate: SearchDistanceEvaluation computes score = max_distance - L2_distance
-        evaluator = cache.similarity_evaluation
-        score = evaluator.evaluation({}, {"search_result": (distance, cache_id)})
-        min_r, max_r = evaluator.range()
-        rank_threshold = (max_r - min_r) * SIMILARITY_THRESH
-
-        if score >= rank_threshold:
-            is_hit = True
-
-    latency = time.time() - start
-    return is_hit, latency
-
-
-def run_test(test_name, queries, encoder, data_manager):
-    """Run a set of queries sequentially and collect metrics."""
-    print(f"\n--- {test_name} ({len(queries)} queries) ---")
-
-    hits = 0
-    latencies = []
-    process = psutil.Process(os.getpid())
-    peak_ram = 0
-
-    for i, q in enumerate(queries):
-        is_hit, latency = query_cache_direct(q, encoder, data_manager)
-        if is_hit:
-            hits += 1
-        latencies.append(latency)
-        ram = process.memory_info().rss / (1024 * 1024)
-        peak_ram = max(peak_ram, ram)
-
-        if (i + 1) % 500 == 0:
-            print(f"  Progress: {i+1}/{len(queries)} "
-                  f"(hits so far: {hits}, avg latency: {np.mean(latencies)*1000:.1f}ms)")
-
-    latencies_ms = np.array(latencies) * 1000
-    total_time = sum(latencies)
-    n = len(queries)
-
-    print(f"\n  Results for: {test_name}")
-    print(f"  Total Time  : {total_time:.2f}s ({n / total_time:.1f} QPS)")
-    print(f"  Cache Hits  : {hits}/{n} ({hits/n*100:.2f}%)")
-    print(f"  Cache Misses: {n-hits}/{n} ({(n-hits)/n*100:.2f}%)")
-    print(f"  Avg Latency : {np.mean(latencies_ms):.2f} ms")
-    print(f"  P50 Latency : {np.percentile(latencies_ms, 50):.2f} ms")
-    print(f"  P90 Latency : {np.percentile(latencies_ms, 90):.2f} ms")
-    print(f"  P99 Latency : {np.percentile(latencies_ms, 99):.2f} ms")
-    print(f"  Peak RAM    : {peak_ram:.1f} MB")
-
-    return {"hits": hits, "total": n, "hit_rate": hits/n,
-            "avg_latency_ms": np.mean(latencies_ms),
-            "p99_latency_ms": np.percentile(latencies_ms, 99),
-            "peak_ram_mb": peak_ram}
-
-
-def run(mode):
-    # 1. Load Dataset
-    print("=" * 60)
-    print(f"GPTCache QQP Benchmark — Mode: {mode.upper()}")
-    print("=" * 60)
-
-    print("\nLoading Quora Question Pairs dataset...")
-    dataset = load_dataset("glue", "qqp", split="train")
-
-    # Split into duplicates and non-duplicates
-    duplicates = dataset.filter(lambda x: x["label"] == 1)
-    non_duplicates = dataset.filter(lambda x: x["label"] == 0)
-    print(f"  Total pairs: {len(dataset)}")
-    print(f"  Duplicates: {len(duplicates)}, Non-duplicates: {len(non_duplicates)}")
-
-    # 2. Setup cache
-    work_dir = f"bench_{mode}"
-    # Clean previous run
-    if os.path.isdir(work_dir):
-        shutil.rmtree(work_dir)
-
-    print(f"\nInitializing GPTCache ({mode})...")
-    encoder, data_manager, faiss_path, sqlite_path = setup_cache(mode, work_dir)
-
-    # 3. Prepare data
-    dup_pairs = list(duplicates.select(range(NUM_INGEST)))
-    db_questions = [pair["question1"] for pair in dup_pairs]
-
-    print(f"\nIngesting {len(db_questions)} questions (batch_size={INGEST_BATCH_SIZE})...")
-    start_insert = time.time()
-    dummy_answers = [f"Answer_{i}" for i in range(len(db_questions))]
-    for start in range(0, len(db_questions), INGEST_BATCH_SIZE):
-        batch_q = db_questions[start : start + INGEST_BATCH_SIZE]
-        batch_a = dummy_answers[start : start + INGEST_BATCH_SIZE]
-        cache.import_data(questions=batch_q, answers=batch_a, batch_size=INGEST_BATCH_SIZE)
-        done = min(start + INGEST_BATCH_SIZE, len(db_questions))
-        elapsed = time.time() - start_insert
-        print(f"  Ingested {done}/{len(db_questions)} "
-              f"({done / elapsed:.0f} vec/s)", flush=True)
-    insert_time = time.time() - start_insert
-    print(f"Ingestion complete in {insert_time:.2f}s "
-          f"({len(db_questions)/insert_time:.0f} vectors/sec)")
-
-    # TP queries: question2 from the same duplicate pairs we ingested
-    tp_queries = [pair["question2"] for pair in dup_pairs[:NUM_TP_TEST]]
-
-    # FP queries: question2 from non-duplicate pairs
-    fp_pairs = list(non_duplicates.select(range(NUM_FP_TEST)))
-    fp_queries = [pair["question2"] for pair in fp_pairs]
-
-    # 4. Run tests
-    tp_results = run_test("True Positive (should HIT)", tp_queries, encoder, data_manager)
-    fp_results = run_test("False Positive (should MISS)", fp_queries, encoder, data_manager)
-
-    # 5. Storage telemetry
+    # Flush the FAISS index to disk before measuring sizes; otherwise the
+    # index file size is 0 until close() runs (auto_flush only triggers
+    # every N saves and may not have fired yet).
+    data_manager.flush()
+    mem = measure_memory(data_manager, faiss_path, sqlite_path)
     data_manager.close()
-    print("\n" + "=" * 60)
-    print(f"FINAL SUMMARY — {mode.upper()}")
-    print("=" * 60)
-    print(f"  TP Hit Rate      : {tp_results['hit_rate']*100:.2f}%  (goal: high)")
-    print(f"  FP Hit Rate      : {fp_results['hit_rate']*100:.2f}%  (goal: low)")
-    print(f"  Avg Latency (TP) : {tp_results['avg_latency_ms']:.2f} ms")
-    print(f"  P99 Latency (TP) : {tp_results['p99_latency_ms']:.2f} ms")
 
-    for filepath in [faiss_path, sqlite_path]:
-        if os.path.isfile(filepath):
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            print(f"  {os.path.basename(filepath):15s}: {size_mb:.2f} MB")
+    print(f"  TP hit rate  : {metrics['tp_hit_rate']*100:.2f}%")
+    print(f"  FP hit rate  : {metrics['fp_hit_rate']*100:.2f}%")
+    print(f"  Search lat   : p50 {metrics['search_latency_ms']['p50']:.3f} ms"
+          f"  p95 {metrics['search_latency_ms']['p95']:.3f} ms"
+          f"  p99 {metrics['search_latency_ms']['p99']:.3f} ms"
+          f"  IQR {metrics['search_latency_ms']['iqr']:.3f}")
+    print(f"  E2E    lat   : p50 {metrics['e2e_latency_ms']['p50']:.3f} ms"
+          f"  p95 {metrics['e2e_latency_ms']['p95']:.3f} ms"
+          f"  p99 {metrics['e2e_latency_ms']['p99']:.3f} ms")
+    print(f"  FAISS RAM    : {mem['faiss_ram_bytes']/1e6:.2f} MB"
+          f"  (serialize_index)")
+    print(f"  FAISS disk   : {mem['faiss_disk_bytes']/1e6:.2f} MB")
+    print(f"  SQLite disk  : {mem['sqlite_disk_bytes']/1e6:.2f} MB")
+
+    if exact_match_metrics is not None:
+        bm = exact_match_metrics["baseline_ms"]
+        sm = exact_match_metrics["shortcut_ms"]
+        print(f"  ExactMatch   : baseline p50 {bm['p50']:.3f} ms"
+              f" -> shortcut p50 {sm['p50']:.6f} ms"
+              f"  (speedup {bm['p50']/max(sm['p50'],1e-9):.0f}x)"
+              f"  hits={exact_match_metrics['exact_match_hits']}")
+
+    return {
+        "name": name,
+        "label": spec["label"],
+        "encoder": encoder.label,
+        "index": spec["index"],
+        "ingest_seconds": ingest_s,
+        "metrics": metrics,
+        "memory": mem,
+        "exact_match": exact_match_metrics,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description="GPTCache QQP benchmark (4-cell matrix)")
+    p.add_argument("--scale", type=int, default=10_000,
+                   help="Number of vectors to ingest. Use 10000 / 100000 / 1000000.")
+    p.add_argument("--n-tp", type=int, default=None,
+                   help="Number of TP queries (default: min(scale/5, 2000))")
+    p.add_argument("--n-fp", type=int, default=None,
+                   help="Number of FP queries (default: same as TP)")
+    p.add_argument("--encoder", choices=["auto", "synthetic"], default="auto",
+                   help="auto = real encoders if installed, else skip; "
+                        "synthetic = deterministic hash-based (no model downloads)")
+    p.add_argument("--data", choices=["auto", "qqp", "synthetic"], default="auto",
+                   help="qqp requires HuggingFace `datasets`; synthetic uses generated pairs")
+    p.add_argument("--threshold", type=float, default=0.90,
+                   help="similarity_threshold (default 0.90)")
+    p.add_argument("--ingest-batch", type=int, default=64)
+    p.add_argument("--warmup", type=int, default=20,
+                   help="queries to discard from latency stats (BP5)")
+    p.add_argument("--repeats", type=int, default=3,
+                   help="how many times to re-run the query set (BP5)")
+    p.add_argument("--threads", type=int, default=_DEFAULT_THREADS,
+                   help="faiss.omp_set_num_threads value (default $GPTCACHE_FAISS_THREADS or 1)")
+    p.add_argument("--cells", default="A,B,C,D",
+                   help="comma-separated cell names to run")
+    p.add_argument("--no-onnx-fallback", action="store_true", default=False,
+                   help="disable PyTorch SBERT-768 fallback for cells A/B when "
+                        "the ONNX dynamic-batch model is unavailable")
+    p.add_argument("--workdir", default="bench_work",
+                   help="directory for per-cell sqlite + faiss files")
+    p.add_argument("--out", default=None,
+                   help="path to write JSON results (default: <workdir>/results.json)")
+    p.add_argument("--exact-repeat-frac", type=float, default=0.0,
+                   help="Fraction of the TP query workload to clone as exact repeats "
+                        "(0.0..1.0). With >0 the harness runs an additional measurement "
+                        "with the gptcache.adapter pipeline so the Step 4 exact-match "
+                        "shortcut can be exercised end-to-end. Default 0.0.")
+    args = p.parse_args()
+
+    if args.n_tp is None:
+        args.n_tp = max(min(args.scale // 5, 2000), 100)
+    if args.n_fp is None:
+        args.n_fp = args.n_tp
+
+    # BP5 - thread pinning
+    faiss.omp_set_num_threads(args.threads)
+
+    # Resolve dataset
+    prefer_qqp = args.data in ("auto", "qqp")
+    data, data_source = load_dataset_or_synthesise(
+        prefer_qqp=prefer_qqp,
+        n_ingest=args.scale,
+        n_tp=args.n_tp,
+        n_fp=args.n_fp,
+    )
+
+    print("=" * 64)
+    print("GPTCache QQP benchmark - 4-cell matrix")
+    print("=" * 64)
+    print(f"  Scale        : {args.scale}")
+    print(f"  TP / FP      : {args.n_tp} / {args.n_fp}")
+    print(f"  Threshold    : {args.threshold}")
+    print(f"  Threads      : {args.threads} (faiss.omp_set_num_threads)")
+    print(f"  Warmup/Reps  : {args.warmup} / {args.repeats}")
+    print(f"  Data source  : {data_source}")
+    print(f"  Encoder mode : {args.encoder}")
+    print(f"  FAISS        : {faiss.__version__}")
+
+    selected = [c for c in CELLS if c["name"] in set(args.cells.split(","))]
+    results = []
+    for spec in selected:
+        out = run_cell(spec, data, args, args.threads)
+        if out is not None:
+            results.append(out)
+
+    # Summary table
+    print("\n" + "=" * 64)
+    print("SUMMARY (search-only and end-to-end latency in ms)")
+    print("=" * 64)
+    print(f"{'Cell':<6}{'Config':<22}{'TP%':>6}{'FP%':>6}"
+          f"{'srchP50':>9}{'srchP95':>9}{'e2eP50':>9}{'e2eP95':>9}"
+          f"{'RAM/MB':>9}{'Disk/MB':>9}{'SQL/MB':>9}")
+    for r in results:
+        m = r["metrics"]
+        mem = r["memory"]
+        print(
+            f"{r['name']:<6}{r['label']:<22}"
+            f"{r['metrics']['tp_hit_rate']*100:>6.1f}{r['metrics']['fp_hit_rate']*100:>6.1f}"
+            f"{m['search_latency_ms']['p50']:>9.3f}{m['search_latency_ms']['p95']:>9.3f}"
+            f"{m['e2e_latency_ms']['p50']:>9.3f}{m['e2e_latency_ms']['p95']:>9.3f}"
+            f"{mem['faiss_ram_bytes']/1e6:>9.2f}{mem['faiss_disk_bytes']/1e6:>9.2f}"
+            f"{mem['sqlite_disk_bytes']/1e6:>9.2f}"
+        )
+
+    out_path = args.out or os.path.join(args.workdir, "results.json")
+    with open(out_path, "w") as f:
+        json.dump({
+            "args": vars(args),
+            "data_source": data_source,
+            "faiss_version": faiss.__version__,
+            "results": results,
+        }, f, indent=2)
+    print(f"\nWrote JSON results to {out_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GPTCache QQP Benchmark")
-    parser.add_argument(
-        "--mode",
-        choices=["baseline", "optimized"],
-        required=True,
-        help="baseline = ONNX+Flat (768d), optimized = MRL+HNSW+SQ8 (256d)",
-    )
-    args = parser.parse_args()
-    run(args.mode)
+    main()

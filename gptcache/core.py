@@ -6,6 +6,7 @@ from gptcache.config import Config
 from gptcache.embedding.string import to_embeddings as string_embedding
 from gptcache.manager import get_data_manager
 from gptcache.manager.data_manager import DataManager
+from gptcache.processor.exact_match import ExactMatchCache
 from gptcache.processor.post import temperature_softmax
 from gptcache.processor.pre import last_content
 from gptcache.report import Report
@@ -14,6 +15,32 @@ from gptcache.similarity_evaluation import SimilarityEvaluation
 from gptcache.utils import import_openai
 from gptcache.utils.cache_func import cache_all
 from gptcache.utils.log import gptcache_log
+
+
+def _pin_faiss_threads():
+    """Pin FAISS OpenMP thread count for deterministic tail latency.
+
+    Order of precedence:
+      1. GPTCACHE_FAISS_THREADS env var (explicit override)
+      2. OMP_NUM_THREADS env var (respect any existing setting)
+      3. min(os.cpu_count(), 4) - sensible default that avoids over-subscription
+
+    Silently no-ops if FAISS isn't installed.
+    """
+    n = os.environ.get("GPTCACHE_FAISS_THREADS")
+    if n is None:
+        n = os.environ.get("OMP_NUM_THREADS")
+    if n is None:
+        n = min(os.cpu_count() or 1, 4)
+    try:
+        n = max(int(n), 1)
+    except (TypeError, ValueError):
+        return
+    try:
+        import faiss  # pylint: disable=C0415
+        faiss.omp_set_num_threads(n)
+    except ImportError:
+        pass
 
 
 class Cache:
@@ -42,6 +69,7 @@ class Cache:
         self.config = Config()
         self.report = Report()
         self.next_cache = None
+        self.exact_match_cache: Optional[ExactMatchCache] = None
 
     def init(
         self,
@@ -78,6 +106,16 @@ class Cache:
         self.post_process_messages_func = post_func if post_func else post_process_messages_func
         self.config = config
         self.next_cache = next_cache
+
+        _pin_faiss_threads()
+
+        if getattr(config, "exact_match_enabled", True):
+            self.exact_match_cache = ExactMatchCache(
+                max_size=getattr(config, "exact_match_max_size", 10_000),
+                ttl_seconds=getattr(config, "exact_match_ttl_seconds", 300.0),
+            )
+        else:
+            self.exact_match_cache = None
 
         @atexit.register
         def close():
