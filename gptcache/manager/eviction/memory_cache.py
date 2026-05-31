@@ -49,14 +49,26 @@ class MemoryCacheEviction(EvictionBase):
             self._cache = cachetools.FIFOCache(maxsize=maxsize, **kwargs)
         elif self._policy == "RR":
             self._cache = cachetools.RRCache(maxsize=maxsize, **kwargs)
+        elif self._policy == "CA_W_TINYLFU":
+            from gptcache.manager.eviction.ca_w_tinylfu import CostAwareWTinyLFU
+            self._cache = CostAwareWTinyLFU(
+                maxsize=maxsize,
+                clean_size=clean_size,
+                on_evict=on_evict,
+                **kwargs,
+            )
         else:
             raise ValueError(f"Unknown policy {policy}")
 
-        self._cache.popitem = popitem_wrapper(self._cache.popitem, on_evict, clean_size)
+        if self._policy != "CA_W_TINYLFU":
+            self._cache.popitem = popitem_wrapper(self._cache.popitem, on_evict, clean_size)
 
     def put(self, objs: List[Any]):
-        for obj in objs:
-            self._cache[obj] = True
+        if self._policy == "CA_W_TINYLFU":
+            self._cache.put(objs)
+        else:
+            for obj in objs:
+                self._cache[obj] = True
 
     def get(self, obj: Any):
         return self._cache.get(obj)

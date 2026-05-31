@@ -113,22 +113,15 @@ def run_policy(
 ) -> dict:
     """Drive a single eviction policy through the query stream.
 
-    Uses a shadow dict to track "what's currently in the cache" since
-    `EvictionBase` itself doesn't expose membership queries. The shadow
-    is kept in sync via the `on_evict` callback.
-
-    Hit/miss is decided by exact key membership in the shadow — this
-    bypasses the similarity layer entirely, which is correct for
-    eviction-policy comparison (similarity is a separate concern).
+    Hit/miss is decided by eviction.get() — returns None on a miss,
+    truthy on a hit (also updates LRU order / frequency state as a
+    side effect, which is correct: a real access should update the policy).
     """
-    cache_shadow = {}
     eviction_count = 0
 
     def on_evict(keys):
         nonlocal eviction_count
         eviction_count += len(keys)
-        for k in keys:
-            cache_shadow.pop(k, None)
 
     eviction = EvictionBase.get(
         name="memory",
@@ -146,12 +139,10 @@ def run_policy(
     for qi in query_stream:
         item = items[qi]
         cost_total_sum += item.cost
-        if qi in cache_shadow:
-            eviction.get(qi)
+        if eviction.get(qi) is not None:
             hits += 1
             cost_hit_sum += item.cost
         else:
-            cache_shadow[qi] = True
             eviction.put([qi])
     elapsed = time.perf_counter() - t0
 
@@ -166,7 +157,6 @@ def run_policy(
         "cost_weighted_hit_rate": cost_hit_sum / max(cost_total_sum, 1e-9),
         "evictions": eviction_count,
         "elapsed_seconds": elapsed,
-        "final_cache_size": len(cache_shadow),
     }
 
 
