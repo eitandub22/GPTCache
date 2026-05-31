@@ -32,6 +32,7 @@ Doorkeeper (Bloom filter, from TinyLFU paper):
 """
 
 import math
+import random
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -44,6 +45,11 @@ DEFAULT_MODEL_TIER = 1.0
 DEFAULT_RESPONSE_SIZE_BYTES = 500
 
 EWMA_FREQ_CAP = 15.0  # aligns freq_score with the [0, 15] cost_score range
+
+# Caffeine's ADMIT_HASHDOS_THRESHOLD adapted for EWMA freq (cap=15, half≈7).
+# A candidate with ewma_freq >= this gets a 1/128 random admission chance
+# even if it loses the score contest, preventing frequency-flooding attacks.
+_HASHDOS_THRESHOLD = 7.0
 
 
 @dataclass
@@ -433,10 +439,25 @@ class CostAwareWTinyLFU:
             self._probation.add_mru(candidate)
             return
 
-        if self._score(candidate) >= self._score(victim):
+        # Strict greater-than: on a tie the victim (proven, in main) wins over
+        # the candidate (unproven, from window). Matches Caffeine's admit().
+        candidate_score = self._score(candidate)
+        victim_score = self._score(victim)
+        if candidate_score > victim_score:
             self._probation.evict_victim()
             self._emit_evict([victim])
             self._probation.add_mru(candidate)
+        elif self._meta[candidate].ewma_freq >= _HASHDOS_THRESHOLD:
+            # Hash-DoS defence: a moderately warm candidate that loses on score
+            # gets a 1/128 random admission chance. Prevents an attacker from
+            # pinning the victim by artificially inflating its frequency.
+            # Matches Caffeine's ADMIT_HASHDOS_THRESHOLD logic.
+            if random.randint(0, 127) == 0:
+                self._probation.evict_victim()
+                self._emit_evict([victim])
+                self._probation.add_mru(candidate)
+            else:
+                self._emit_evict([candidate])
         else:
             self._emit_evict([candidate])
 
