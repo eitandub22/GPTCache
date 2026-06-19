@@ -306,6 +306,8 @@ class CostAwareWTinyLFU:
         ewma_warmup: int = 20,
         time_fn: Callable[[], float] = time.monotonic,
         default_cost: Optional[LLMCost] = None,
+        cost_aware: bool = True,
+        freq_weight: float = 16.0,
         **_unused,
     ):
         if maxsize < 4:
@@ -313,11 +315,18 @@ class CostAwareWTinyLFU:
                 "maxsize must be >= 4 for W-TinyLFU to allocate all three segments"
             )
         self._maxsize = maxsize
-        self._clean_size = max(1, clean_size)
+        self._clean_size = max(1, clean_size if clean_size is not None else 1)
         self._on_evict = on_evict or (lambda keys: None)
         self._decay_rate = decay_rate
         self._time = time_fn
         self._default_cost = default_cost or LLMCost()
+        # cost_aware=False collapses the score to frequency-only, reproducing a
+        # plain W-TinyLFU (the prior-art baseline). freq_weight controls how
+        # strongly frequency dominates cost: 16.0 (>= cost range of 15) keeps the
+        # original lexicographic behaviour; lower values blend cost into the
+        # decision so it influences eviction beyond mere tie-breaking.
+        self._cost_aware = cost_aware
+        self._freq_weight = freq_weight
 
         window_size = max(1, int(maxsize * window_ratio))
         main_size = maxsize - window_size
@@ -382,16 +391,22 @@ class CostAwareWTinyLFU:
         m.last_access = now
 
     def _score(self, key: Any) -> float:
-        """Lexicographic admission score: frequency dominates, cost breaks ties.
+        """Admission score: frequency weighted by ``freq_weight``, plus cost.
 
-        Both components are in [0, 15]. One unit of freq_score (= 16 in the
-        combined score) outweighs the full cost range (max 15), so a
-        twice-accessed cheap item always beats a once-accessed expensive one.
+        Both components are in [0, 15]. With ``freq_weight = 16`` (default) one
+        unit of freq_score outweighs the full cost range (max 15), so the score
+        is lexicographic — a twice-accessed cheap item always beats a
+        once-accessed expensive one and cost only breaks exact ties. Lower
+        ``freq_weight`` blends cost into the ordering so it can override small
+        frequency differences. ``cost_aware=False`` drops the cost term
+        entirely, reproducing a plain frequency-only W-TinyLFU.
         """
         m = self._meta[key]
         freq_score = m.ewma_freq  # in [0, EWMA_FREQ_CAP] = [0, 15]
-        cost_score = self._cost_tracker.score(m.cost)  # in [0, 15]
-        return freq_score * 16.0 + cost_score
+        score = freq_score * self._freq_weight
+        if self._cost_aware:
+            score += self._cost_tracker.score(m.cost)  # cost_score in [0, 15]
+        return score
 
     def _touch_segments(self, key: Any) -> None:
         if key in self._protected:

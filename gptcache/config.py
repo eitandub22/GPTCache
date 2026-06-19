@@ -39,6 +39,12 @@ class Config:
         disable TTL (not recommended unless full coupling is wired up).
     :type exact_match_ttl_seconds: Optional[float]
 
+    :param model_tier: pricing tier multiplier for the LLM being cached. Used by
+        the CA_W_TINYLFU eviction policy to weight regeneration cost; a GPT-4-class
+        model at ~$0.06/1k tokens might use ``model_tier=20`` relative to a
+        GPT-3.5-class default of ``1.0``. Has no effect with other eviction policies.
+    :type model_tier: float
+
     Example:
         .. code-block:: python
 
@@ -63,6 +69,7 @@ class Config:
             exact_match_enabled: bool = True,
             exact_match_max_size: int = 10000,
             exact_match_ttl_seconds: Optional[float] = 300.0,
+            model_tier: float = 1.0,
     ):
         if similarity_threshold < 0 or similarity_threshold > 1:
             raise CacheError(
@@ -84,3 +91,4 @@ class Config:
         self.exact_match_enabled = exact_match_enabled
         self.exact_match_max_size = exact_match_max_size
         self.exact_match_ttl_seconds = exact_match_ttl_seconds
+        self.model_tier = model_tier

@@ -63,9 +63,9 @@ class MemoryCacheEviction(EvictionBase):
         if self._policy != "CA_W_TINYLFU":
             self._cache.popitem = popitem_wrapper(self._cache.popitem, on_evict, clean_size)
 
-    def put(self, objs: List[Any]):
+    def put(self, objs: List[Any], costs=None):
         if self._policy == "CA_W_TINYLFU":
-            self._cache.put(objs)
+            self._cache.put(objs, costs=costs)
         else:
             for obj in objs:
                 self._cache[obj] = True

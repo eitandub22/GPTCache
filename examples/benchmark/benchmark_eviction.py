@@ -48,6 +48,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from gptcache.manager.eviction.manager import EvictionBase
+from gptcache.manager.eviction.ca_w_tinylfu import LLMCost
 
 
 @dataclass
@@ -135,6 +136,8 @@ def run_policy(
     cost_hit_sum = 0.0
     cost_total_sum = 0.0
 
+    _is_ca = policy == "CA_W_TINYLFU"
+
     t0 = time.perf_counter()
     for qi in query_stream:
         item = items[qi]
@@ -143,7 +146,16 @@ def run_policy(
             hits += 1
             cost_hit_sum += item.cost
         else:
-            eviction.put([qi])
+            if _is_ca:
+                # Pass the item's synthetic cost so the admission scoring is
+                # actually cost-aware, not just frequency-aware.
+                eviction.put([qi], costs=[LLMCost(
+                    generation_latency_ms=item.cost,
+                    token_count=0,
+                    model_tier=1.0,
+                )])
+            else:
+                eviction.put([qi])
     elapsed = time.perf_counter() - t0
 
     return {

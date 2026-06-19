@@ -233,7 +233,7 @@ class Faiss(VectorBase):
                 len(self._tombstones),
             )
         else:
-            ids_to_remove = np.array(ids)
+            ids_to_remove = np.array(ids, dtype=np.int64)
             self._index.remove_ids(faiss.IDSelectorBatch(ids_to_remove.size, faiss.swig_ptr(ids_to_remove)))
 
     def flush(self):

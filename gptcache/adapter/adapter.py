@@ -251,6 +251,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                 return cache_data_convert(return_message)
 
     next_cache = chat_cache.next_cache
+    _llm_elapsed_ms = 0.0
     if next_cache:
         kwargs["cache_obj"] = next_cache
         kwargs["cache_context"] = context
@@ -264,9 +265,11 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         if search_only_flag:
             # cache miss
             return None
+        _llm_t0 = time.perf_counter()
         llm_data = time_cal(
             llm_handler, func_name="llm_request", report_func=chat_cache.report.llm
         )(*args, **kwargs)
+        _llm_elapsed_ms = (time.perf_counter() - _llm_t0) * 1000.0
 
     if not llm_data:
         return None
@@ -279,6 +282,24 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+
+                # Build per-entry regeneration cost for the CA_W_TINYLFU eviction
+                # layer. Latency is measured around the real LLM call; token count
+                # is estimated from the answer length (chars / 4 ≈ tokens) as a
+                # universal proxy that works across all adapter backends.
+                llm_cost = None
+                try:
+                    from gptcache.manager.eviction.ca_w_tinylfu import LLMCost  # pylint: disable=C0415
+                    answer_str = _extract_answer_string(handled_llm_data)
+                    token_estimate = max(1, len(answer_str) // 4) if answer_str else 100
+                    llm_cost = LLMCost(
+                        generation_latency_ms=_llm_elapsed_ms,
+                        token_count=token_estimate,
+                        model_tier=getattr(chat_cache.config, "model_tier", 1.0),
+                    )
+                except ImportError:
+                    pass
+
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -289,6 +310,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     embedding_data,
                     extra_param=context.get("save_func", None),
                     session=session,
+                    llm_cost=llm_cost,
                 )
                 # Mirror the answer into the exact-match cache so the next
                 # identical query short-circuits before the embedder.
@@ -539,6 +561,7 @@ async def aadapt(
                 return cache_data_convert(return_message)
 
     next_cache = chat_cache.next_cache
+    _llm_elapsed_ms = 0.0
     if next_cache:
         kwargs["cache_obj"] = next_cache
         kwargs["cache_context"] = context
@@ -549,7 +572,9 @@ async def aadapt(
             llm_handler, cache_data_convert, update_cache_callback, *args, **kwargs
         )
     else:
+        _llm_t0 = time.perf_counter()
         llm_data = await llm_handler(*args, **kwargs)
+        _llm_elapsed_ms = (time.perf_counter() - _llm_t0) * 1000.0
 
     if cache_enable:
         try:
@@ -559,6 +584,20 @@ async def aadapt(
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+
+                llm_cost = None
+                try:
+                    from gptcache.manager.eviction.ca_w_tinylfu import LLMCost  # pylint: disable=C0415
+                    answer_str = _extract_answer_string(handled_llm_data)
+                    token_estimate = max(1, len(answer_str) // 4) if answer_str else 100
+                    llm_cost = LLMCost(
+                        generation_latency_ms=_llm_elapsed_ms,
+                        token_count=token_estimate,
+                        model_tier=getattr(chat_cache.config, "model_tier", 1.0),
+                    )
+                except ImportError:
+                    pass
+
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -569,6 +608,7 @@ async def aadapt(
                     embedding_data,
                     extra_param=context.get("save_func", None),
                     session=session,
+                    llm_cost=llm_cost,
                 )
                 # Mirror the answer into the exact-match cache so the next
                 # identical query short-circuits before the embedder.

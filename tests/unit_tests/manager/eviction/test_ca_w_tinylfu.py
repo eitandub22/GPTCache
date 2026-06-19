@@ -259,3 +259,45 @@ def test_doorkeeper_cleared_on_sketch_reset():
         f"sketch total {cache._sketch._total} should be below threshold "
         f"{threshold} after at least one reset"
     )
+
+
+# ---------------------------------------------------------------------------
+# t9 — cost_aware=False drops the cost term (frequency-only / prior-art baseline)
+# ---------------------------------------------------------------------------
+
+def test_cost_aware_false_ignores_cost():
+    """With cost_aware=False, two items of equal frequency score identically
+    regardless of cost, and the score is purely freq_score * freq_weight."""
+    cache = CostAwareWTinyLFU(
+        maxsize=40, cost_aware=False, freq_weight=16.0,
+        ewma_warmup=1, time_fn=lambda: 0.0,
+    )
+    cheap = LLMCost(generation_latency_ms=100.0, token_count=10, model_tier=1.0)
+    pricey = LLMCost(generation_latency_ms=15000.0, token_count=2000, model_tier=20.0)
+    cache.put(["A"], costs=[cheap])
+    cache.put(["B"], costs=[pricey])
+
+    # Equal access frequency -> cost must not differentiate the two.
+    assert cache._score("A") == cache._score("B")
+    # Score is exactly the (weighted) frequency term — no cost contribution.
+    assert cache._score("A") == cache._meta["A"].ewma_freq * 16.0
+
+
+# ---------------------------------------------------------------------------
+# t10 — freq_weight scales the frequency term in the admission score
+# ---------------------------------------------------------------------------
+
+def test_freq_weight_scales_frequency_term():
+    """Identical access patterns yield the same ewma_freq; the combined score
+    scales linearly with freq_weight (verified with cost disabled)."""
+    c16 = CostAwareWTinyLFU(maxsize=40, freq_weight=16.0, cost_aware=False,
+                            time_fn=lambda: 0.0)
+    c1 = CostAwareWTinyLFU(maxsize=40, freq_weight=1.0, cost_aware=False,
+                           time_fn=lambda: 0.0)
+    for c in (c16, c1):
+        c.put(["A"])
+        for _ in range(3):
+            c.get("A")
+
+    assert c16._meta["A"].ewma_freq == c1._meta["A"].ewma_freq
+    assert c16._score("A") == 16.0 * c1._score("A")
