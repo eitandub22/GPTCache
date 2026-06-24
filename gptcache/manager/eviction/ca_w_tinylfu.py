@@ -5,7 +5,7 @@ Count-Min Sketch + Doorkeeper) with a lexicographic admission score that
 prefers items with higher regeneration cost when frequency is equal.
 
 Admission score (lexicographic — frequency always dominates):
-    freq_score  = min(ewma_freq, 15.0)           per-item, time-decayed
+    freq_score  = min(sketch.estimate(key), 15.0) * exp(-λ * dt)   [0, 15]
     cost_score  = EWMACostTracker.score(cost)     log-cost z-score in [0, 15]
     score       = freq_score * 16.0 + cost_score
 
@@ -13,11 +13,21 @@ Admission score (lexicographic — frequency always dominates):
     so a twice-accessed cheap item always wins over a once-accessed expensive
     item. Cost only breaks ties within the same frequency level.
 
-Frequency decay (our unique contribution vs. related work):
-    f' = min(f * exp(-λ * dt) + 1, 15)
-where dt = seconds since last access (monotonic clock). Every item decays
-independently — no global reset schedule. A once-hot item that has not been
-touched for 19 hours (default λ = 1e-5) loses frequency organically.
+Frequency signal (Count-Min Sketch — the W-TinyLFU core):
+    The admission contest reads the sketch's frequency estimate, NOT a
+    per-resident-item counter. This is what makes the policy real W-TinyLFU:
+    the sketch persists across eviction, so a popular item that was evicted
+    and returns is still recognised as popular — the property that lets
+    TinyLFU beat LRU. Estimates are clamped to [0, 15] (Caffeine's 4-bit
+    ceiling) and aged by the sketch's periodic halving.
+
+Time decay (our twist on the sketch read):
+    freq_score = min(sketch.estimate(key), 15) * exp(-λ * dt)
+where dt = seconds since the item's last access (monotonic clock). Decay is
+applied at *read* time, so a once-hot item that has not been touched discounts
+its own frequency without disturbing the shared sketch. With λ = 1e-5 an item
+idle for ~19 hours loses ~half its frequency weight; with dt ≈ 0 (a fast
+replay) decay is a no-op and scoring is pure sketch frequency.
 
 Cost normalization (prevents 600× raw-cost spread from overwhelming frequency):
     log(cost) → EWMA(mean, variance) → z-score → clamp[-1,1] → [0, 15]
@@ -33,6 +43,7 @@ Doorkeeper (Bloom filter, from TinyLFU paper):
 
 import math
 import random
+import statistics
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -42,13 +53,14 @@ from typing import Any, Callable, Dict, List, Optional
 DEFAULT_GENERATION_LATENCY_MS = 1000.0
 DEFAULT_TOKEN_COUNT = 100
 DEFAULT_MODEL_TIER = 1.0
-DEFAULT_RESPONSE_SIZE_BYTES = 500
 
 EWMA_FREQ_CAP = 15.0  # aligns freq_score with the [0, 15] cost_score range
 
-# Caffeine's ADMIT_HASHDOS_THRESHOLD adapted for EWMA freq (cap=15, half≈7).
-# A candidate with ewma_freq >= this gets a 1/128 random admission chance
-# even if it loses the score contest, preventing frequency-flooding attacks.
+# Caffeine's ADMIT_HASHDOS_THRESHOLD adapted for the [0, 15] sketch range
+# (cap=15, half≈7). A candidate whose sketch frequency >= this gets a 1/128
+# random admission chance even if it loses the score contest, preventing
+# frequency-flooding attacks. Uses the raw (undecayed) estimate so an attacker
+# cannot evade the guard by pausing to let decay shrink the signal.
 _HASHDOS_THRESHOLD = 7.0
 
 
@@ -67,7 +79,6 @@ class LLMCost:
     generation_latency_ms: float = DEFAULT_GENERATION_LATENCY_MS
     token_count: int = DEFAULT_TOKEN_COUNT
     model_tier: float = DEFAULT_MODEL_TIER
-    response_size_bytes: int = DEFAULT_RESPONSE_SIZE_BYTES
 
     @property
     def cost(self) -> float:
@@ -80,12 +91,14 @@ class LLMCost:
 
 @dataclass
 class ItemMeta:
-    """Per-item state for the lexicographic scoring function."""
+    """Per-item state for the lexicographic scoring function.
+
+    Frequency is NOT stored here — it lives in the shared Count-Min Sketch so
+    it survives eviction. ``last_access`` only feeds the read-time decay.
+    """
 
     key: Any
-    ewma_freq: float = 0.0   # time-decayed access frequency, capped at EWMA_FREQ_CAP
     cost: float = 0.0        # LLMCost.cost snapshot at last insert/update
-    size: int = 1            # response_size_bytes (kept for potential future use)
     last_access: float = 0.0 # time.monotonic() of last touch
 
 
@@ -264,6 +277,12 @@ class _LRUSegment:
         key, _ = self._od.popitem(last=False)
         return key
 
+    def pop_mru(self) -> Optional[Any]:
+        if not self._od:
+            return None
+        key, _ = self._od.popitem(last=True)
+        return key
+
     def remove(self, key: Any) -> bool:
         return self._od.pop(key, None) is not None
 
@@ -286,7 +305,7 @@ class CostAwareWTinyLFU:
         score = freq_score * 16 + cost_score  (lexicographic)
 
     Get flow:
-        1. Doorkeeper-gated sketch increment + EWMA freq update.
+        1. Doorkeeper-gated sketch increment + last-access timestamp.
         2. Segment routing: protected → touch; probation → promote; window → touch.
 
     Public API matches MemoryCacheEviction (put / get / policy) for Phase 2 routing.
@@ -295,7 +314,6 @@ class CostAwareWTinyLFU:
     def __init__(
         self,
         maxsize: int,
-        clean_size: int = 1,
         on_evict: Optional[Callable[[List[Any]], None]] = None,
         decay_rate: float = 1e-5,
         sketch_width: int = 2048,
@@ -308,6 +326,12 @@ class CostAwareWTinyLFU:
         default_cost: Optional[LLMCost] = None,
         cost_aware: bool = True,
         freq_weight: float = 16.0,
+        adaptive_window: bool = False,
+        adapt_sample_factor: float = 10.0,
+        adapt_step_ratio: float = 0.0625,
+        adapt_step_decay: float = 0.98,
+        adapt_objective: str = "cost",
+        adapt_decision_intervals: int = 3,
         **_unused,
     ):
         if maxsize < 4:
@@ -315,7 +339,8 @@ class CostAwareWTinyLFU:
                 "maxsize must be >= 4 for W-TinyLFU to allocate all three segments"
             )
         self._maxsize = maxsize
-        self._clean_size = max(1, clean_size if clean_size is not None else 1)
+        # ponytail: CA evicts exactly one item per admission contest by
+        # construction, so the cachetools `clean_size` batch knob does not apply.
         self._on_evict = on_evict or (lambda keys: None)
         self._decay_rate = decay_rate
         self._time = time_fn
@@ -328,6 +353,7 @@ class CostAwareWTinyLFU:
         self._cost_aware = cost_aware
         self._freq_weight = freq_weight
 
+        self._protected_ratio = protected_ratio
         window_size = max(1, int(maxsize * window_ratio))
         main_size = maxsize - window_size
         protected_size = max(1, int(main_size * protected_ratio))
@@ -336,6 +362,32 @@ class CostAwareWTinyLFU:
         self._window = _LRUSegment(window_size)
         self._probation = _LRUSegment(probation_size)
         self._protected = _LRUSegment(protected_size)
+
+        # --- Adaptive window (Caffeine-style hill-climb; default OFF) ---
+        # When enabled, the window<->main boundary is re-tuned every interval to
+        # maximize the *cost-weighted* hit rate (the novel twist vs. Caffeine,
+        # which climbs raw hit rate). Default off => byte-for-byte identical to
+        # the fixed-window policy.
+        self._adaptive = adaptive_window
+        self._adapt_interval = max(1, int(maxsize * adapt_sample_factor))
+        self._adapt_step = adapt_step_ratio * maxsize  # signed; + grows window
+        self._adapt_decay = adapt_step_decay
+        self._adapt_objective = adapt_objective
+        self._adapt_accesses = 0
+        self._adapt_hits = 0
+        self._adapt_hit_cost = 0.0
+        self._adapt_total_cost = 0.0
+        self._prev_objective: Optional[float] = None
+        # A decision averages the objective over this many intervals before
+        # moving the boundary, so one noisy interval can't flip direction.
+        self._decision_intervals = max(1, adapt_decision_intervals)
+        self._interval_objs: List[float] = []   # objectives awaiting a decision
+        self._regress_count = 0                  # consecutive regressions (hysteresis)
+        self._seeded = False                     # has the gradient sign been probed yet
+        self._probe_stage = 0                    # 0..2 two-sided gradient probe
+        self._probe_up_obj = 0.0                 # objective at the +probe window
+        self._probe_mag = 0                      # probe step magnitude
+        self._settle = 0                         # intervals to skip after a move
 
         self._meta: Dict[Any, ItemMeta] = {}
         self._sketch = CountMinSketch(sketch_width, sketch_depth)
@@ -367,8 +419,10 @@ class CostAwareWTinyLFU:
     def get(self, obj: Any) -> Optional[bool]:
         if obj not in self._meta:
             return None
+        hit_cost = self._meta[obj].cost
         self._record_access(obj)
         self._touch_segments(obj)
+        self._tick_adapt(is_hit=True, cost=hit_cost)
         return True
 
     # ------------------------------------------------------------------
@@ -376,22 +430,34 @@ class CostAwareWTinyLFU:
     # ------------------------------------------------------------------
 
     def _record_access(self, key: Any) -> None:
-        """Doorkeeper-gated sketch increment + per-item EWMA freq decay."""
+        """Doorkeeper-gated sketch increment + last-access timestamp.
+
+        Frequency lives in the shared sketch (so it survives eviction); the
+        first sighting of a key is suppressed by the Doorkeeper and only its
+        second+ accesses reach the sketch, keeping one-hit wonders out.
+        """
         k_hash = hash(key)
         if self._doorkeeper.allow_and_add(k_hash):
-            reset = self._sketch.increment(key)
-            if reset:
+            if self._sketch.increment(key):
                 self._doorkeeper.clear()
+        self._meta[key].last_access = self._time()
 
-        m = self._meta[key]
-        now = self._time()
-        dt = max(0.0, now - m.last_access)
+    def _freq_score(self, key: Any) -> float:
+        """Sketch frequency in [0, EWMA_FREQ_CAP], discounted by idle time.
+
+        The estimate is read from the shared Count-Min Sketch (W-TinyLFU's
+        core — it remembers frequency across eviction), clamped to Caffeine's
+        4-bit ceiling, then multiplied by ``exp(-λ·dt)`` so an item that has
+        not been touched recently discounts its own weight. dt ≈ 0 ⇒ decay is
+        a no-op and the score is pure sketch frequency.
+        """
+        raw = min(float(self._sketch.estimate(key)), EWMA_FREQ_CAP)
+        dt = max(0.0, self._time() - self._meta[key].last_access)
         decay = math.exp(-self._decay_rate * dt) if dt > 0 else 1.0
-        m.ewma_freq = min(EWMA_FREQ_CAP, m.ewma_freq * decay + 1.0)
-        m.last_access = now
+        return raw * decay
 
     def _score(self, key: Any) -> float:
-        """Admission score: frequency weighted by ``freq_weight``, plus cost.
+        """Admission score: sketch frequency weighted by ``freq_weight``, plus cost.
 
         Both components are in [0, 15]. With ``freq_weight = 16`` (default) one
         unit of freq_score outweighs the full cost range (max 15), so the score
@@ -401,11 +467,9 @@ class CostAwareWTinyLFU:
         frequency differences. ``cost_aware=False`` drops the cost term
         entirely, reproducing a plain frequency-only W-TinyLFU.
         """
-        m = self._meta[key]
-        freq_score = m.ewma_freq  # in [0, EWMA_FREQ_CAP] = [0, 15]
-        score = freq_score * self._freq_weight
+        score = self._freq_score(key) * self._freq_weight
         if self._cost_aware:
-            score += self._cost_tracker.score(m.cost)  # cost_score in [0, 15]
+            score += self._cost_tracker.score(self._meta[key].cost)  # [0, 15]
         return score
 
     def _touch_segments(self, key: Any) -> None:
@@ -423,26 +487,25 @@ class CostAwareWTinyLFU:
         if key in self._meta:
             m = self._meta[key]
             m.cost = cost.cost
-            m.size = max(1, cost.response_size_bytes)
             self._record_access(key)
             self._touch_segments(key)
+            self._tick_adapt(is_hit=True, cost=cost.cost)
             return
 
         now = self._time()
         self._meta[key] = ItemMeta(
             key=key,
-            ewma_freq=0.0,
             cost=cost.cost,
-            size=max(1, cost.response_size_bytes),
             last_access=now,
         )
-        self._record_access(key)  # sets ewma_freq → 1.0, registers in doorkeeper
+        self._record_access(key)  # registers in doorkeeper (first sighting, no sketch bump)
 
         if self._window.is_full():
             window_victim = self._window.evict_victim()
             if window_victim is not None:
                 self._admit_or_reject(window_victim)
         self._window.add_mru(key)
+        self._tick_adapt(is_hit=False, cost=cost.cost)
 
     def _admit_or_reject(self, candidate: Any) -> None:
         if not self._probation.is_full():
@@ -462,11 +525,11 @@ class CostAwareWTinyLFU:
             self._probation.evict_victim()
             self._emit_evict([victim])
             self._probation.add_mru(candidate)
-        elif self._meta[candidate].ewma_freq >= _HASHDOS_THRESHOLD:
+        elif min(float(self._sketch.estimate(candidate)), EWMA_FREQ_CAP) >= _HASHDOS_THRESHOLD:
             # Hash-DoS defence: a moderately warm candidate that loses on score
             # gets a 1/128 random admission chance. Prevents an attacker from
             # pinning the victim by artificially inflating its frequency.
-            # Matches Caffeine's ADMIT_HASHDOS_THRESHOLD logic.
+            # Matches Caffeine's ADMIT_HASHDOS_THRESHOLD logic (raw sketch freq).
             if random.randint(0, 127) == 0:
                 self._probation.evict_victim()
                 self._emit_evict([victim])
@@ -488,3 +551,177 @@ class CostAwareWTinyLFU:
             self._meta.pop(k, None)
         if keys:
             self._on_evict(keys)
+
+    # ------------------------------------------------------------------
+    # Adaptive window (optional; default off reproduces fixed-window behaviour)
+    # ------------------------------------------------------------------
+
+    def _tick_adapt(self, is_hit: bool, cost: float) -> None:
+        """Accumulate per-interval access stats and close intervals.
+
+        No-op unless ``adaptive_window=True`` — so the default policy is
+        byte-for-byte identical to the fixed-window version (regression guard).
+        """
+        if not self._adaptive:
+            return
+        self._adapt_accesses += 1
+        self._adapt_total_cost += cost
+        if is_hit:
+            self._adapt_hits += 1
+            self._adapt_hit_cost += cost
+        if self._adapt_accesses >= self._adapt_interval:
+            self._end_interval()
+
+    def _interval_objective(self) -> float:
+        """Objective for the interval just closed (cost-weighted or raw hit)."""
+        if self._adapt_objective == "hit":
+            return (self._adapt_hits / self._adapt_accesses
+                    if self._adapt_accesses else 0.0)
+        return (self._adapt_hit_cost / self._adapt_total_cost
+                if self._adapt_total_cost > 0 else 0.0)
+
+    def _reset_interval(self) -> None:
+        self._adapt_accesses = 0
+        self._adapt_hits = 0
+        self._adapt_hit_cost = 0.0
+        self._adapt_total_cost = 0.0
+
+    def _end_interval(self) -> None:
+        """Bank one interval's objective; decide once enough have accumulated.
+
+        The interval right after a boundary move is discarded as a settling
+        period: its hit rate reflects the *old* split (the freshly enlarged
+        segment has not refilled yet), so banking it would feed the climber a
+        transient instead of the new steady state — the bias that made the
+        gradient probe mis-seed.
+        """
+        if self._settle > 0:
+            self._settle -= 1
+            self._reset_interval()
+            return
+        self._interval_objs.append(self._interval_objective())
+        self._reset_interval()
+        if len(self._interval_objs) >= self._decision_intervals:
+            self._climb()
+
+    def _climb(self) -> None:
+        """Hill-climb the window<->main boundary toward a better objective.
+
+        The objective is the *cost-weighted* hit rate (``adapt_objective="cost"``)
+        — the novel twist vs. Caffeine, which climbs raw hit rate. Three guards
+        against the §2.0 "climbs the wrong way" failure:
+
+          1. The decision uses the *mean* objective over ``_decision_intervals``
+             intervals, not one noisy interval.
+          2. A two-sided gradient probe (``_seed_direction``) samples the
+             objective at W0±probe and commits the step sign toward the better
+             side, instead of always growing first. The large probe escapes
+             locally-flat regions where a one-step gradient is pure noise.
+          3. Reversals only fire after *two consecutive* regressions (temporal
+             hysteresis), so one noisy decision can't flip direction, while a
+             sustained regression (the optimum was passed) reverses promptly.
+
+        # ponytail: 1-D bounded climb; adopt Caffeine's sampled scheme only if
+        # this still misbehaves under the heavy validation.
+        """
+        measurement = statistics.fmean(self._interval_objs)
+        self._interval_objs = []
+
+        if not self._seeded:
+            self._seed_direction(measurement)
+            return
+
+        if measurement < self._prev_objective:
+            self._regress_count += 1
+            if self._regress_count >= 2:
+                # Sustained regression: the optimum is behind us — reverse and
+                # shrink the step so the window settles around the peak.
+                self._adapt_step = -self._adapt_step * self._adapt_decay
+                self._regress_count = 0
+        else:
+            self._regress_count = 0
+        self._prev_objective = measurement
+        self._step_window()
+
+    def _seed_direction(self, measurement: float) -> None:
+        """Probe both directions over the first three decisions, then commit.
+
+        Stage 0 (at W0): jump up by ``_probe_mag`` to sample the +direction.
+        Stage 1 (at W0+probe): bank that objective, jump down to W0-probe.
+        Stage 2 (at W0-probe): pick the step sign toward the better side and
+        start the real climb. Probing both sides — not just continuing to grow —
+        removes the §2.0 "always grows first" bias, and a probe of maxsize/8
+        gives a gradient signal even when W0 sits in a locally-flat region.
+        """
+        if self._probe_stage == 0:
+            self._probe_mag = max(int(round(abs(self._adapt_step))), self._maxsize // 8)
+            self._move_window(self._window.maxsize + self._probe_mag)
+            self._probe_stage = 1
+        elif self._probe_stage == 1:
+            self._probe_up_obj = measurement
+            self._move_window(self._window.maxsize - 2 * self._probe_mag)
+            self._probe_stage = 2
+        else:
+            grow = self._probe_up_obj >= measurement  # +probe vs -probe objective
+            self._adapt_step = abs(self._adapt_step) * (1.0 if grow else -1.0)
+            self._prev_objective = measurement
+            self._seeded = True
+            self._step_window()
+
+    def _step_window(self) -> None:
+        delta = int(round(self._adapt_step))
+        if delta != 0:
+            self._move_window(self._window.maxsize + delta)
+
+    def _move_window(self, target: int) -> None:
+        """Resize the window and arm a one-interval settling skip."""
+        self._resize_window(target)
+        self._settle = 1
+
+    def _resize_window(self, new_window_size: int) -> None:
+        """Move the window<->main boundary, conserving total capacity.
+
+        Shrinking demotes window-LRU victims into main via the normal admission
+        contest; growing pulls probation-MRU items back up into the window and
+        trims any resulting main overflow. Segment capacities always re-sum to
+        ``maxsize`` so no slot is created or lost.
+        """
+        new_window_size = max(1, min(new_window_size, self._maxsize - 2))
+        old_window_size = self._window.maxsize
+        if new_window_size == old_window_size:
+            return
+
+        new_main = self._maxsize - new_window_size
+        new_protected = max(1, int(new_main * self._protected_ratio))
+        new_probation = max(1, new_main - new_protected)
+
+        if new_window_size < old_window_size:
+            # Window shrinks, main grows: demote window overflow into main.
+            self._window.maxsize = new_window_size
+            self._probation.maxsize = new_probation
+            self._protected.maxsize = new_protected
+            while len(self._window) > new_window_size:
+                victim = self._window.evict_victim()
+                if victim is None:
+                    break
+                self._admit_or_reject(victim)
+        else:
+            # Window grows, main shrinks: pull probation-MRU up, trim overflow.
+            self._window.maxsize = new_window_size
+            while len(self._window) < new_window_size and len(self._probation) > 0:
+                promoted = self._probation.pop_mru()
+                if promoted is None:
+                    break
+                self._window.add_mru(promoted)
+            self._probation.maxsize = new_probation
+            self._protected.maxsize = new_protected
+            while len(self._probation) > self._probation.maxsize:
+                evicted = self._probation.evict_victim()
+                if evicted is None:
+                    break
+                self._emit_evict([evicted])
+            while len(self._protected) > self._protected.maxsize:
+                demoted = self._protected.evict_victim()
+                if demoted is None:
+                    break
+                self._admit_or_reject(demoted)

@@ -62,13 +62,12 @@ def sq_dist_threshold(similarity_threshold: float) -> float:
 # ---------------------------------------------------------------------------
 # Model-tier helper (for LLMCost and cost_weighted_hit_rate)
 # ---------------------------------------------------------------------------
-_GPT4_KEYWORDS  = ("gpt-4",)
 _CLAUDE_KEYWORDS = ("claude-2", "claude-3", "claude-opus", "claude-sonnet")
 _LLAMA_KEYWORDS  = ("llama", "vicuna", "alpaca", "mistral", "falcon")
 
 def _model_tier(model_name: str) -> float:
     m = (model_name or "").lower()
-    if any(k in m for k in _GPT4_KEYWORDS):
+    if "gpt-4" in m:
         return 20.0
     if any(k in m for k in _CLAUDE_KEYWORDS):
         return 15.0
@@ -92,7 +91,8 @@ class ConvEntry:
     n_tokens:    int    # tiktoken count of response
     model_name:  str
     model_tier:  float
-    llm_cost:    float  # LLMCost.cost scalar
+    llm_cost:    float     # LLMCost.cost scalar
+    llm_cost_obj: LLMCost  # full cost object, reused on cache miss (CA only)
 
 
 # ---------------------------------------------------------------------------
@@ -102,51 +102,23 @@ def _count_tokens(text: str, enc) -> int:
     return len(enc.encode(text))
 
 
-def load_lmsys(n: int, seed: int) -> List[ConvEntry]:
-    """Stream first `n` valid first-turn exchanges from LMSYS-Chat-1M."""
+def _stream_entries(dataset, split, msgs_key, model_fn, tier_fn, n) -> List[ConvEntry]:
+    """Stream first `n` valid first-turn (user, assistant) exchanges.
+
+    `msgs_key` is the row field holding the message list ("conversation" for
+    LMSYS, "messages" for UltraChat); `model_fn(row)` names the model and
+    `tier_fn(r_tok, model)` assigns the pricing tier.
+    """
     import tiktoken
     from datasets import load_dataset
 
     enc = tiktoken.get_encoding("cl100k_base")
-    ds = load_dataset("lmsys/lmsys-chat-1m", split="train", streaming=True)
+    ds = load_dataset(dataset, split=split, streaming=True)
     entries: List[ConvEntry] = []
     for row in ds:
         if len(entries) >= n:
             break
-        conv = row.get("conversation", [])
-        if len(conv) < 2:
-            continue
-        if conv[0].get("role") != "user" or conv[1].get("role") != "assistant":
-            continue
-        prompt   = (conv[0].get("content") or "").strip()
-        response = (conv[1].get("content") or "").strip()
-        if not prompt or not response:
-            continue
-        p_tok = _count_tokens(prompt, enc)
-        r_tok = _count_tokens(response, enc)
-        if p_tok > 512 or r_tok < 5:
-            continue
-        model = row.get("model", "")
-        tier  = _model_tier(model)
-        lat   = _latency_estimate_ms(tier, r_tok)
-        cost  = LLMCost(generation_latency_ms=lat, token_count=r_tok,
-                        model_tier=tier).cost
-        entries.append(ConvEntry(prompt, response, r_tok, model, tier, cost))
-    return entries
-
-
-def load_ultrachat(n: int, seed: int) -> List[ConvEntry]:
-    """Stream first `n` valid first-turn exchanges from UltraChat-200K."""
-    import tiktoken
-    from datasets import load_dataset
-
-    enc = tiktoken.get_encoding("cl100k_base")
-    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
-    entries: List[ConvEntry] = []
-    for row in ds:
-        if len(entries) >= n:
-            break
-        msgs = row.get("messages", [])
+        msgs = row.get(msgs_key, [])
         if len(msgs) < 2:
             continue
         if msgs[0].get("role") != "user" or msgs[1].get("role") != "assistant":
@@ -159,18 +131,42 @@ def load_ultrachat(n: int, seed: int) -> List[ConvEntry]:
         r_tok = _count_tokens(response, enc)
         if p_tok > 512 or r_tok < 5:
             continue
-        # UltraChat has no model field — assign tier by response length
-        if r_tok >= 500:
-            tier = 20.0
-        elif r_tok >= 200:
-            tier = 3.0
-        else:
-            tier = 1.0
-        lat  = _latency_estimate_ms(tier, r_tok)
-        cost = LLMCost(generation_latency_ms=lat, token_count=r_tok,
-                       model_tier=tier).cost
-        entries.append(ConvEntry(prompt, response, r_tok, "ultrachat", tier, cost))
+        model = model_fn(row)
+        tier  = tier_fn(r_tok, model)
+        cost_obj = LLMCost(
+            generation_latency_ms=_latency_estimate_ms(tier, r_tok),
+            token_count=r_tok, model_tier=tier,
+        )
+        entries.append(ConvEntry(prompt, response, r_tok, model, tier,
+                                 cost_obj.cost, cost_obj))
     return entries
+
+
+def load_lmsys(n: int, seed: int) -> List[ConvEntry]:
+    """Stream first `n` valid first-turn exchanges from LMSYS-Chat-1M."""
+    return _stream_entries(
+        "lmsys/lmsys-chat-1m", "train", "conversation",
+        model_fn=lambda row: row.get("model", ""),
+        tier_fn=lambda r_tok, model: _model_tier(model),
+        n=n,
+    )
+
+
+def load_ultrachat(n: int, seed: int) -> List[ConvEntry]:
+    """Stream first `n` valid first-turn exchanges from UltraChat-200K."""
+    # UltraChat has no model field — assign tier by response length.
+    def _tier(r_tok, _model):
+        if r_tok >= 500:
+            return 20.0
+        if r_tok >= 200:
+            return 3.0
+        return 1.0
+    return _stream_entries(
+        "HuggingFaceH4/ultrachat_200k", "train_sft", "messages",
+        model_fn=lambda row: "ultrachat",
+        tier_fn=_tier,
+        n=n,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +254,7 @@ def run_one(
     policy_label:    Optional[str] = None,
     virtual_clock_sec: float = 0.0,
     query_order:     Optional[List[int]] = None,
+    track_mem:       bool = False,
 ) -> dict:
     """
     Replay a query stream against a fresh SSDataManager + eviction policy.
@@ -291,7 +288,8 @@ def run_one(
     cost_total = sum(entries[qi].llm_cost for qi in order)
     latencies_ms: List[float] = []
 
-    tracemalloc.start()
+    if track_mem:
+        tracemalloc.start()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         db_path  = os.path.join(tmpdir, "cache.db")
@@ -337,19 +335,16 @@ def run_one(
                 tok_saved  += entry.n_tokens
                 cost_saved += entry.llm_cost
             else:
-                llm_cost_obj = LLMCost(
-                    generation_latency_ms=_latency_estimate_ms(
-                        entry.model_tier, entry.n_tokens),
-                    token_count=entry.n_tokens,
-                    model_tier=entry.model_tier,
-                ) if is_ca else None
                 data_manager.save(entry.prompt, entry.response, emb,
-                                  **({"llm_cost": llm_cost_obj} if is_ca else {}))
+                                  **({"llm_cost": entry.llm_cost_obj} if is_ca else {}))
 
         data_manager.close()
 
-    _, peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    if track_mem:
+        _, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    else:
+        peak_mem = 0
 
     n = len(order)
     latencies_ms.sort()
@@ -421,6 +416,10 @@ def main():
     p.add_argument("--sweep",        action="store_true",
                    help="Sweep window_ratio x freq_weight for CA_W_TINYLFU "
                         "(ignores --window-ratio/--freq-weight for that policy)")
+    p.add_argument("--adaptive-window", action="store_true",
+                   help="Also run a CA_W_TINYLFU_ADAPT variant whose window<->main "
+                        "boundary self-tunes via a Caffeine-style hill-climb on the "
+                        "cost-weighted objective (no per-workload window tuning)")
     p.add_argument("--virtual-clock-sec", type=float, default=0.0,
                    help="Advance a virtual clock by N seconds per query so "
                         "CA_W_TINYLFU's EWMA time-decay is exercised (default: 0 = off)")
@@ -443,6 +442,9 @@ def main():
                    help="Number of repeats per config (default: 3)")
     p.add_argument("--clean-pct",    type=float, default=0.20,
                    help="Clean size as fraction of cache size (default: 0.20)")
+    p.add_argument("--track-mem",    action="store_true",
+                   help="measure peak memory via tracemalloc (~3x slower; "
+                        "off by default — peak_memory_mb reports 0 when off)")
     p.add_argument("--seed",         type=int, default=0)
     p.add_argument("--workdir",      default="bench_lmsys")
     p.add_argument("--out",          default=None,
@@ -473,6 +475,14 @@ def main():
                     "CA_W_TINYLFU", "CA_W_TINYLFU",
                     {"window_ratio": args.window_ratio,
                      "freq_weight": args.freq_weight, "cost_aware": True},
+                ))
+            if args.adaptive_window:
+                # Same policy with the window<->main boundary self-tuned online.
+                specs.append((
+                    "CA_W_TINYLFU_ADAPT", "CA_W_TINYLFU",
+                    {"window_ratio": args.window_ratio,
+                     "freq_weight": args.freq_weight, "cost_aware": True,
+                     "adaptive_window": True},
                 ))
         elif pol == "WTINYLFU_FREQ":
             specs.append((
@@ -560,7 +570,8 @@ def main():
                                 args.threshold, clean_size,
                                 eviction_params=evp, policy_label=label,
                                 virtual_clock_sec=args.virtual_clock_sec,
-                                query_order=query_order)
+                                query_order=query_order,
+                                track_mem=args.track_mem)
                     runs.append(r)
                 except Exception as exc:
                     print(f"  [skip] {label} cs={cache_size} rep={rep}: {exc}")

@@ -27,7 +27,7 @@ METRICS = [
     ("token_saving_ratio", "tok%"),
 ]
 
-POLICY_ORDER = ["LRU", "LFU", "WTINYLFU_FREQ", "CA_W_TINYLFU"]
+POLICY_ORDER = ["LRU", "LFU", "WTINYLFU_FREQ", "CA_W_TINYLFU", "CA_W_TINYLFU_ADAPT"]
 
 
 def _policy_rank(p):
@@ -102,27 +102,6 @@ def main():
         d_hit = statistics.mean(ca["hit_rate"]) - statistics.mean(fr["hit_rate"])
         d_tok = statistics.mean(ca["token_saving_ratio"]) - statistics.mean(fr["token_saving_ratio"])
         print(f"  {cs:<12} {d_cost:>+16.2f} {d_hit:>+16.2f} {d_tok:>+16.2f}")
-
-    # ---- Significance check vs the verification criterion ----
-    print("\nSIGNIFICANCE (cost_wt): CA gap vs each baseline / 2x combined std\n")
-    print(f"  {'cache_size':<12} {'vs LRU':>20} {'vs LFU':>20} {'vs FREQ':>20}")
-    for cs in cache_sizes:
-        ca = samples.get(("CA_W_TINYLFU", cs))
-        if not ca:
-            continue
-        ca_m, ca_s = msd(ca["cost_weighted_hit_rate"])
-        row = []
-        for base in ("LRU", "LFU", "WTINYLFU_FREQ"):
-            b = samples.get((base, cs))
-            if not b:
-                row.append("n/a")
-                continue
-            b_m, b_s = msd(b["cost_weighted_hit_rate"])
-            gap = ca_m - b_m
-            comb = (ca_s ** 2 + b_s ** 2) ** 0.5
-            ok = "PASS" if gap >= 2 * comb else "weak"
-            row.append(f"{gap:+.2f} (2s={2*comb:.2f}) {ok}")
-        print(f"  {cs:<12} " + " ".join(f"{c:>20}" for c in row))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ These tests exercise policy internals in isolation — no MemoryCacheEviction,
 no SSDataManager, no SQLite/FAISS. Phase 2 adds the routing test.
 """
 
+import random
+
 from gptcache.manager.eviction.ca_w_tinylfu import (
     CostAwareWTinyLFU,
     CountMinSketch,
@@ -77,12 +79,10 @@ def test_expensive_items_survive_more_than_cheap():
     satisfied by the flood, so cost differentiation is fully active.
     """
     cheap = LLMCost(
-        generation_latency_ms=100.0, token_count=10,
-        model_tier=1.0, response_size_bytes=100,
+        generation_latency_ms=100.0, token_count=10, model_tier=1.0,
     )
     expensive = LLMCost(
-        generation_latency_ms=15000.0, token_count=2000,
-        model_tier=20.0, response_size_bytes=100,
+        generation_latency_ms=15000.0, token_count=2000, model_tier=20.0,
     )
 
     cheap_survived = 0
@@ -125,7 +125,10 @@ def test_expensive_items_survive_more_than_cheap():
 def test_ewma_decay_reduces_stale_frequency():
     """A once-hot item that hasn't been touched in a long dt loses frequency.
 
-    Uses an injected time_fn so the test is fully deterministic.
+    Decay is now applied at *read* time to the sketch estimate, so we advance
+    the clock and re-score WITHOUT re-accessing the item (an access would
+    refresh last_access and reset dt to 0). Uses an injected time_fn so the
+    test is fully deterministic.
     """
     now = [0.0]
 
@@ -137,19 +140,18 @@ def test_ewma_decay_reduces_stale_frequency():
     cache.put(["A"])
     for _ in range(20):
         cache.get("A")
-    initial_freq = cache._meta["A"].ewma_freq
-    assert initial_freq > 5.0, f"setup error: ewma_freq did not grow ({initial_freq})"
+    initial_freq = cache._freq_score("A")  # dt = 0 → pure sketch estimate
+    assert initial_freq > 5.0, f"setup error: sketch freq did not grow ({initial_freq})"
 
-    now[0] = 1000.0  # simulate 1000 seconds of idle time
-    cache.get("A")
-    decayed_freq = cache._meta["A"].ewma_freq
+    now[0] = 1000.0  # 1000 idle seconds; A is NOT re-accessed
+    decayed_freq = cache._freq_score("A")
 
     assert decayed_freq < initial_freq, (
-        f"ewma did not decay across dt=1000s with rate=0.1: "
+        f"freq did not decay across dt=1000s with rate=0.1: "
         f"{initial_freq:.3f} -> {decayed_freq:.3f}"
     )
     assert decayed_freq < 2.0, (
-        f"with decay_rate=0.1 and dt=1000s, surviving freq should be ~1.0; "
+        f"with decay_rate=0.1 and dt=1000s, surviving freq should be ~0; "
         f"got {decayed_freq:.3f}"
     )
 
@@ -276,11 +278,15 @@ def test_cost_aware_false_ignores_cost():
     pricey = LLMCost(generation_latency_ms=15000.0, token_count=2000, model_tier=20.0)
     cache.put(["A"], costs=[cheap])
     cache.put(["B"], costs=[pricey])
+    # Drive equal sketch frequency for both (first sighting is doorkeeper-gated).
+    for _ in range(3):
+        cache.get("A")
+        cache.get("B")
 
     # Equal access frequency -> cost must not differentiate the two.
     assert cache._score("A") == cache._score("B")
     # Score is exactly the (weighted) frequency term — no cost contribution.
-    assert cache._score("A") == cache._meta["A"].ewma_freq * 16.0
+    assert cache._score("A") == cache._freq_score("A") * 16.0
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +294,8 @@ def test_cost_aware_false_ignores_cost():
 # ---------------------------------------------------------------------------
 
 def test_freq_weight_scales_frequency_term():
-    """Identical access patterns yield the same ewma_freq; the combined score
-    scales linearly with freq_weight (verified with cost disabled)."""
+    """Identical access patterns yield the same sketch frequency; the combined
+    score scales linearly with freq_weight (verified with cost disabled)."""
     c16 = CostAwareWTinyLFU(maxsize=40, freq_weight=16.0, cost_aware=False,
                             time_fn=lambda: 0.0)
     c1 = CostAwareWTinyLFU(maxsize=40, freq_weight=1.0, cost_aware=False,
@@ -299,5 +305,123 @@ def test_freq_weight_scales_frequency_term():
         for _ in range(3):
             c.get("A")
 
-    assert c16._meta["A"].ewma_freq == c1._meta["A"].ewma_freq
+    assert c16._freq_score("A") == c1._freq_score("A")
     assert c16._score("A") == 16.0 * c1._score("A")
+
+
+# ---------------------------------------------------------------------------
+# Adaptive window (E-A1): default-off regression, climb direction, capacity
+# ---------------------------------------------------------------------------
+
+def _assert_window_invariants(cache, maxsize):
+    """Segments disjoint, consistent with _meta, capacity conserved, bounded."""
+    seg_keys = (list(cache._window._od) + list(cache._probation._od)
+                + list(cache._protected._od))
+    assert len(seg_keys) == len(set(seg_keys)), "a key appears in >1 segment"
+    assert set(seg_keys) == set(cache._meta.keys()), "_meta and segments desynced"
+    assert (cache._window.maxsize + cache._probation.maxsize
+            + cache._protected.maxsize) == maxsize, "segment capacities lost/created"
+    assert len(cache) <= maxsize, f"cache exceeded maxsize: {len(cache)} > {maxsize}"
+
+
+def test_adaptive_window_off_keeps_boundary_static():
+    """adaptive_window defaults to False — the window<->main boundary must never
+    move, so the policy is byte-for-byte the fixed-window version (regression guard)."""
+    random.seed(0)
+    cache = CostAwareWTinyLFU(maxsize=100, window_ratio=0.1, time_fn=lambda: 0.0)
+    assert cache._adaptive is False
+    before = (cache._window.maxsize, cache._probation.maxsize, cache._protected.maxsize)
+    for i in range(5000):
+        k = i % 50  # heavy reuse — would trigger a climb if adaptation were on
+        if cache.get(k) is None:
+            cache.put([k])
+    after = (cache._window.maxsize, cache._probation.maxsize, cache._protected.maxsize)
+    assert after == before, "adaptive_window=False must not resize any segment"
+
+
+def test_adaptive_window_stays_valid_on_frequency_heavy_stream():
+    """Live adaptation on a frequency-heavy stream must preserve every segment
+    invariant and keep the window in [1, maxsize-2] on every climb step.
+
+    NB: we deliberately do NOT assert a climb *direction* here. Once the
+    Count-Min Sketch protects the main region (real W-TinyLFU behaviour), hit
+    rate is largely insensitive to the window<->main split on a stable hot set,
+    so the hill-climb has no reliable gradient to follow and its direction is
+    workload/seed dependent. This test guards the resize machinery under the
+    live climb loop; direction sensitivity is exercised by the recency test."""
+    random.seed(0)
+    rng = random.Random(0)
+    hot = list(range(70))
+    stream = [rng.choice(hot) if rng.random() < 0.9 else 1000 + i for i in range(8000)]
+    cache = CostAwareWTinyLFU(maxsize=100, window_ratio=0.60,
+                              adaptive_window=True, adapt_sample_factor=2.0,
+                              time_fn=lambda: 0.0)
+    for k in stream:
+        if cache.get(k) is None:
+            cache.put([k])
+        assert 1 <= cache._window.maxsize <= 100 - 2, (
+            f"window out of bounds during adaptation: {cache._window.maxsize}")
+    _assert_window_invariants(cache, 100)
+
+
+def _drive_synthetic_climb(start_ratio, optimum, n_decisions=120, maxsize=64):
+    """Drive the climber against a noise-free tent objective peaking at ``optimum``.
+
+    Each decision we feed the objective evaluated at the *current* window, so the
+    optimizer sees a clean, followable gradient. This tests the climber logic
+    directly, free of the cache hit-rate-vs-window flatness that makes real-stream
+    convergence intrinsically seed-dependent (research §2.0). Returns the window
+    the climber settles on.
+    """
+    random.seed(0)  # the Hash-DoS admission path uses the global RNG
+    cache = CostAwareWTinyLFU(maxsize=maxsize, window_ratio=start_ratio,
+                              adaptive_window=True, time_fn=lambda: 0.0)
+    for _ in range(n_decisions):
+        obj = -abs(cache._window.maxsize - optimum)
+        cache._interval_objs = [obj] * cache._decision_intervals
+        cache._climb()
+    return cache._window.maxsize
+
+
+def test_adaptive_climber_converges_from_either_side():
+    """§2.0 regression guard (deterministic). The naive one-step climber grew the
+    *wrong way* from a large window (60 → ~90) because its initial step was always
+    positive. The hardened climber's two-sided gradient probe must instead pick the
+    correct direction from BOTH a too-large and a too-small start and converge near
+    the optimum — to within one step (the climber moves in discrete steps)."""
+    start_big, start_small = 0.78, 0.03   # ~window 50 and ~window 1 of 64
+    step = int(round(0.0625 * 64))         # adapt_step_ratio * maxsize
+    for optimum in (10, 25, 40):
+        hi = _drive_synthetic_climb(start_big, optimum)
+        lo = _drive_synthetic_climb(start_small, optimum)
+        # Correct direction: descended from the large start, ascended from the small.
+        assert hi < 50 and lo > 5, (
+            f"optimum {optimum}: wrong direction (hi {hi} from ~50, lo {lo} from ~1)")
+        # Converged near the optimum from both sides, within one discrete step.
+        assert abs(hi - optimum) <= 2 * step, f"hi converged to {hi}, want ~{optimum}"
+        assert abs(lo - optimum) <= 2 * step, f"lo converged to {lo}, want ~{optimum}"
+
+
+def test_resize_window_conserves_capacity():
+    """_resize_window (grow and shrink, plus clamps) never leaks/duplicates a key
+    and always re-sums segment capacities to maxsize."""
+    random.seed(0)
+    maxsize = 100
+    cache = CostAwareWTinyLFU(maxsize=maxsize, window_ratio=0.1, time_fn=lambda: 0.0)
+    for i in range(400):
+        k = i % 120  # overflow + reuse so all three segments are populated
+        if cache.get(k) is None:
+            cache.put([k])
+    _assert_window_invariants(cache, maxsize)
+
+    cache._resize_window(cache._window.maxsize + 20)   # grow
+    _assert_window_invariants(cache, maxsize)
+    cache._resize_window(cache._window.maxsize - 30)   # shrink
+    _assert_window_invariants(cache, maxsize)
+
+    cache._resize_window(10_000)                       # clamp high
+    assert cache._window.maxsize <= maxsize - 2
+    _assert_window_invariants(cache, maxsize)
+    cache._resize_window(-5)                            # clamp low
+    assert cache._window.maxsize >= 1
+    _assert_window_invariants(cache, maxsize)

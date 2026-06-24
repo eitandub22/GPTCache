@@ -283,22 +283,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                 else:
                     question.content = pre_store_data
 
-                # Build per-entry regeneration cost for the CA_W_TINYLFU eviction
-                # layer. Latency is measured around the real LLM call; token count
-                # is estimated from the answer length (chars / 4 ≈ tokens) as a
-                # universal proxy that works across all adapter backends.
-                llm_cost = None
-                try:
-                    from gptcache.manager.eviction.ca_w_tinylfu import LLMCost  # pylint: disable=C0415
-                    answer_str = _extract_answer_string(handled_llm_data)
-                    token_estimate = max(1, len(answer_str) // 4) if answer_str else 100
-                    llm_cost = LLMCost(
-                        generation_latency_ms=_llm_elapsed_ms,
-                        token_count=token_estimate,
-                        model_tier=getattr(chat_cache.config, "model_tier", 1.0),
-                    )
-                except ImportError:
-                    pass
+                llm_cost = _build_llm_cost(
+                    handled_llm_data, _llm_elapsed_ms, chat_cache.config
+                )
 
                 time_cal(
                     chat_cache.data_manager.save,
@@ -585,18 +572,9 @@ async def aadapt(
                 else:
                     question.content = pre_store_data
 
-                llm_cost = None
-                try:
-                    from gptcache.manager.eviction.ca_w_tinylfu import LLMCost  # pylint: disable=C0415
-                    answer_str = _extract_answer_string(handled_llm_data)
-                    token_estimate = max(1, len(answer_str) // 4) if answer_str else 100
-                    llm_cost = LLMCost(
-                        generation_latency_ms=_llm_elapsed_ms,
-                        token_count=token_estimate,
-                        model_tier=getattr(chat_cache.config, "model_tier", 1.0),
-                    )
-                except ImportError:
-                    pass
+                llm_cost = _build_llm_cost(
+                    handled_llm_data, _llm_elapsed_ms, chat_cache.config
+                )
 
                 time_cal(
                     chat_cache.data_manager.save,
@@ -649,6 +627,26 @@ def _extract_answer_string(handled_llm_data):
     if isinstance(handled_llm_data, list) and handled_llm_data:
         return _extract_answer_string(handled_llm_data[0])
     return None
+
+
+def _build_llm_cost(handled_llm_data, elapsed_ms, config):
+    """Build the per-entry regeneration cost for the CA_W_TINYLFU eviction layer.
+
+    Latency is measured around the real LLM call; token count is estimated from
+    the answer length (chars / 4 ≈ tokens) as a universal proxy that works across
+    all adapter backends. Returns ``None`` if the eviction module is unavailable.
+    """
+    try:
+        from gptcache.manager.eviction.ca_w_tinylfu import LLMCost  # pylint: disable=C0415
+    except ImportError:
+        return None
+    answer_str = _extract_answer_string(handled_llm_data)
+    token_estimate = max(1, len(answer_str) // 4) if answer_str else 100
+    return LLMCost(
+        generation_latency_ms=elapsed_ms,
+        token_count=token_estimate,
+        model_tier=getattr(config, "model_tier", 1.0),
+    )
 
 
 _input_summarizer = None

@@ -51,9 +51,10 @@ class MemoryCacheEviction(EvictionBase):
             self._cache = cachetools.RRCache(maxsize=maxsize, **kwargs)
         elif self._policy == "CA_W_TINYLFU":
             from gptcache.manager.eviction.ca_w_tinylfu import CostAwareWTinyLFU
+            # clean_size intentionally not forwarded: CA evicts one item per
+            # admission contest, so the batch-evict knob does not apply.
             self._cache = CostAwareWTinyLFU(
                 maxsize=maxsize,
-                clean_size=clean_size,
                 on_evict=on_evict,
                 **kwargs,
             )
