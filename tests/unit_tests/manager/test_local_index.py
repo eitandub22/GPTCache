@@ -153,6 +153,123 @@ class TestLocalIndex(unittest.TestCase):
             index.mul_add([VectorData(id=i, data=v) for v, i in zip(data, range(100))])
             self.assertEqual(index.search(data[0])[0][1], 0)
 
+    def test_faiss_hnsw_pq(self):
+        """Test HNSW+PQ and HNSW+PQ+Refine: training-buffer warmup, search,
+        tombstone deletion, rebuild, persistence and the small-dataset lazy flush."""
+        # Seed for determinism: plain PQ is lossy on this small training set, so
+        # whether a query's own vector lands in the top-k (assertIn below) depends
+        # on the random data. Fix the RNG so the test is order-independent.
+        np.random.seed(0)
+        # m_pq must divide DIM (512). pq_train_size < SIZE so training fires
+        # during the normal mul_add path.
+        for index_type in ("hnsw_pq", "hnsw_pq_refine"):
+            cls = partial(
+                Faiss, dimension=DIM, index_type=index_type,
+                m_pq=16, pq_train_size=512,
+            )
+
+            # --- Training-buffer warmup, add and search ---
+            with TemporaryDirectory(dir='./') as root:
+                index_path = str((Path(root) / 'index.bin').absolute())
+                index = cls(index_file_path=index_path, top_k=TOP_K)
+                data = np.random.randn(SIZE, DIM).astype(np.float32)
+                index.mul_add(
+                    [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+                )
+                self.assertEqual(index.index_type, index_type)
+                # SIZE > pq_train_size, so PQ trained and all vectors flushed.
+                self.assertTrue(index._index.is_trained)
+                self.assertEqual(index.count(), SIZE)
+                # Use a high per-call efSearch so HNSW search is near-exhaustive
+                # and reliably surfaces the query's own node; otherwise default
+                # efSearch on this tiny under-trained index misses it nondeterministically.
+                self.assertEqual(len(index.search(data[0], ef_search=SIZE)), TOP_K)
+                result_ids = [r[1] for r in index.search(data[0], ef_search=SIZE)]
+                if index_type == "hnsw_pq_refine":
+                    # Full-precision re-rank makes self the exact nearest neighbor.
+                    self.assertEqual(result_ids[0], 0)
+                else:
+                    # Plain PQ is lossy — self must at least be in the top-k.
+                    self.assertIn(0, result_ids)
+
+            # --- Tombstone deletion filters results (shared hnsw path) ---
+            with TemporaryDirectory(dir='./') as root:
+                index_path = str((Path(root) / 'index.bin').absolute())
+                index = cls(index_file_path=index_path, top_k=TOP_K)
+                data = np.random.randn(SIZE, DIM).astype(np.float32)
+                index.mul_add(
+                    [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+                )
+                index.delete([0])
+                result_ids = [r[1] for r in index.search(data[0])]
+                self.assertNotIn(0, result_ids)
+                self.assertEqual(index.count(), SIZE)
+
+            # --- Rebuild preserves tombstones (PQ inherits HNSW no-evict) ---
+            with TemporaryDirectory(dir='./') as root:
+                index_path = str((Path(root) / 'index.bin').absolute())
+                index = cls(index_file_path=index_path, top_k=TOP_K)
+                data = np.random.randn(SIZE, DIM).astype(np.float32)
+                index.mul_add(
+                    [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+                )
+                index.delete([0, 1, 2])
+                self.assertEqual(len(index._tombstones), 3)
+                index.rebuild(list(range(3, SIZE)))
+                self.assertEqual(len(index._tombstones), 3)
+                result_ids = [r[1] for r in index.search(data[0])]
+                for ghost in (0, 1, 2):
+                    self.assertNotIn(ghost, result_ids)
+
+            # --- Persistence: index + tombstones survive save/load ---
+            with TemporaryDirectory(dir='./') as root:
+                index_path = str((Path(root) / 'index.bin').absolute())
+                index = cls(index_file_path=index_path, top_k=TOP_K)
+                data = np.random.randn(SIZE, DIM).astype(np.float32)
+                index.mul_add(
+                    [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+                )
+                index.delete([0, 1])
+                index.close()
+                reloaded = cls(index_file_path=index_path, top_k=TOP_K)
+                self.assertEqual(len(reloaded._tombstones), 2)
+                self.assertEqual(reloaded.count(), SIZE)
+                result_ids = [r[1] for r in reloaded.search(data[0])]
+                self.assertNotIn(0, result_ids)
+                self.assertNotIn(1, result_ids)
+
+        # --- Small dataset (< pq_train_size): lazy flush makes it searchable ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = Faiss(
+                index_file_path=index_path, dimension=DIM, top_k=TOP_K,
+                index_type="hnsw_pq", m_pq=16, pq_train_size=10_000,
+            )
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add(
+                [VectorData(id=i, data=v) for v, i in zip(data, list(range(SIZE)))]
+            )
+            # Still buffered — training threshold not reached yet.
+            self.assertFalse(index._index.is_trained)
+            # search() must trigger the lazy train+flush so data is queryable.
+            results = index.search(data[0])
+            self.assertTrue(index._index.is_trained)
+            self.assertEqual(len(results), TOP_K)
+            self.assertEqual(index.count(), SIZE)
+
+        # --- Create via VectorBase factory with PQ params ---
+        with TemporaryDirectory(dir='./') as root:
+            index_path = str((Path(root) / 'index.bin').absolute())
+            index = VectorBase(
+                'faiss', top_k=3, dimension=DIM,
+                index_path=index_path, index_type='hnsw_pq_refine',
+                m_pq=16, k_factor=8, pq_train_size=256,
+            )
+            data = np.random.randn(SIZE, DIM).astype(np.float32)
+            index.mul_add([VectorData(id=i, data=v) for v, i in zip(data, range(SIZE))])
+            # High efSearch so HNSW surfaces the self node for the refine re-rank.
+            self.assertEqual(index.search(data[0], ef_search=SIZE)[0][1], 0)
+
     def test_hnswlib(self):
         cls = partial(Hnswlib, max_elements=MAX_ELEMENTS, dimension=DIM)
         self._internal_test_normal(cls)

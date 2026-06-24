@@ -151,6 +151,10 @@ class VectorBase:
             # 10K synthetic sweep showed ef=32 holds TP and ef=64 leaves 4x headroom;
             # see docs/efsearch-sweep.md. Override per-call via Faiss.search(ef_search=...).
             hnsw_ef_search = kwargs.get("hnsw_ef_search", 64)
+            # PQ knobs for index_type "hnsw_pq"/"hnsw_pq_refine" (ignored otherwise).
+            m_pq = kwargs.get("m_pq", 32)
+            k_factor = kwargs.get("k_factor", 4)
+            pq_train_size = kwargs.get("pq_train_size", None)
             VectorBase.check_dimension(dimension)
             vector_base = Faiss(
                 index_file_path=index_path,
@@ -160,6 +164,9 @@ class VectorBase:
                 hnsw_m=hnsw_m,
                 hnsw_ef_construction=hnsw_ef_construction,
                 hnsw_ef_search=hnsw_ef_search,
+                m_pq=m_pq,
+                k_factor=k_factor,
+                pq_train_size=pq_train_size,
             )
         elif name == "chromadb":
             from gptcache.manager.vector_data.chroma import Chromadb

@@ -290,8 +290,15 @@ def load_dataset_or_synthesise(prefer_qqp, n_ingest, n_tp, n_fp):
 # Cache setup per cell
 # ---------------------------------------------------------------------------
 
-def setup_cell(encoder, index_kind, work_dir, similarity_threshold, max_size):
-    """Initialise a fresh GPTCache for a cell. Returns (data_manager, faiss_path, sqlite_path)."""
+def setup_cell(encoder, index_kind, work_dir, similarity_threshold, max_size,
+               hnsw_m=32, m_pq=32, k_factor=4):
+    """Initialise a fresh GPTCache for a cell. Returns (data_manager, faiss_path, sqlite_path).
+
+    ``index_kind`` selects the FAISS index: ``flat``, ``hnsw_sq8``, ``hnsw_pq``
+    (Product Quantization) or ``hnsw_pq_refine`` (PQ + full-precision re-rank).
+    ``hnsw_m``/``m_pq``/``k_factor`` tune the graph degree, PQ code length and
+    refine over-fetch respectively.
+    """
     shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(work_dir, exist_ok=True)
     sqlite_path = os.path.join(work_dir, "sqlite.db")
@@ -302,7 +309,13 @@ def setup_cell(encoder, index_kind, work_dir, similarity_threshold, max_size):
         vector_base = VectorBase("faiss", dimension=encoder.dimension, index_path=faiss_path)
     elif index_kind == "hnsw_sq8":
         vector_base = VectorBase(
-            "faiss", dimension=encoder.dimension, index_path=faiss_path, index_type="hnsw_sq8"
+            "faiss", dimension=encoder.dimension, index_path=faiss_path,
+            index_type="hnsw_sq8", hnsw_m=hnsw_m,
+        )
+    elif index_kind in ("hnsw_pq", "hnsw_pq_refine"):
+        vector_base = VectorBase(
+            "faiss", dimension=encoder.dimension, index_path=faiss_path,
+            index_type=index_kind, hnsw_m=hnsw_m, m_pq=m_pq, k_factor=k_factor,
         )
     else:
         raise ValueError(f"unknown index_kind: {index_kind}")
@@ -317,14 +330,42 @@ def setup_cell(encoder, index_kind, work_dir, similarity_threshold, max_size):
     return data_manager, faiss_path, sqlite_path
 
 
-def ingest(encoder, db_questions, batch_size=64):
-    """Time the ingest path. Returns total seconds."""
+def encode_corpus(encoder, questions, batch_size):
+    """Encode the whole corpus once, batched. Returns an (n, dim) float32 array."""
+    embs = []
+    for start in range(0, len(questions), batch_size):
+        e = encoder.to_embeddings(questions[start:start + batch_size])
+        embs.append(np.asarray(e, dtype=np.float32))
+    return np.vstack(embs)
+
+
+def ingest(encoder, db_questions, data_manager, batch_size=64, precomputed=None):
+    """Time the ingest path. Returns total seconds.
+
+    If ``precomputed`` (an (n, dim) corpus-embedding array) is given, insert it
+    directly via data_manager.import_data instead of re-encoding. This lets
+    cells that share an encoder (all MRL cells) skip redundant encode passes.
+    import_data applies the same normalize() as cache.import_data, so stored
+    vectors are identical. Query-time encoding in measure_cell is untouched, so
+    latency/recall stay honest.
+    """
     dummy_answers = [f"a_{i}" for i in range(len(db_questions))]
     t0 = time.perf_counter()
-    for start in range(0, len(db_questions), batch_size):
-        bq = db_questions[start:start + batch_size]
-        ba = dummy_answers[start:start + batch_size]
-        cache.import_data(questions=bq, answers=ba, batch_size=batch_size)
+    if precomputed is None:
+        for start in range(0, len(db_questions), batch_size):
+            bq = db_questions[start:start + batch_size]
+            ba = dummy_answers[start:start + batch_size]
+            cache.import_data(questions=bq, answers=ba, batch_size=batch_size)
+    else:
+        for start in range(0, len(db_questions), batch_size):
+            sl = slice(start, start + batch_size)
+            bq = db_questions[sl]
+            data_manager.import_data(
+                questions=bq,
+                answers=dummy_answers[sl],
+                embedding_datas=list(precomputed[sl]),
+                session_ids=[None] * len(bq),
+            )
     return time.perf_counter() - t0
 
 
@@ -502,33 +543,52 @@ CELLS = [
     {"name": "B", "label": "ONNX/768/HNSW+SQ8", "encoder": "onnx",      "index": "hnsw_sq8"},
     {"name": "C", "label": "MRL/256/Flat",      "encoder": "mrl",       "index": "flat"},
     {"name": "D", "label": "MRL/256/HNSW+SQ8", "encoder": "mrl",       "index": "hnsw_sq8"},
+    # Compression frontier on the production MRL/256 encoder (S1/S2/S3).
+    # E/F trade graph quality for code size; G/H sweep the HNSW degree M.
+    {"name": "E", "label": "MRL/256/HNSW+PQ",        "encoder": "mrl", "index": "hnsw_pq"},
+    {"name": "F", "label": "MRL/256/HNSW+PQ+Refine", "encoder": "mrl", "index": "hnsw_pq_refine"},
+    {"name": "G", "label": "MRL/256/HNSW+SQ8 (M=16)", "encoder": "mrl", "index": "hnsw_sq8", "hnsw_m": 16},
+    {"name": "H", "label": "MRL/256/HNSW+SQ8 (M=24)", "encoder": "mrl", "index": "hnsw_sq8", "hnsw_m": 24},
 ]
 
 
-def run_cell(spec, data, args, threads):
+def run_cell(spec, data, args, threads, encoder_cache):
     name = spec["name"]
     print(f"\n=== Cell {name} - {spec['label']} ===")
 
     encoder_kind = spec["encoder"]
-    if args.encoder == "synthetic":
-        # Force-synthetic regardless of cell - useful for harness sanity runs.
-        # Pick the dim that matches the cell's logical encoder.
-        encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else 256)
+    reuse = not args.no_reuse_embeddings
+    cached = encoder_cache.get(encoder_kind) if reuse else None
+    if cached is not None:
+        encoder, corpus_emb = cached
     else:
-        onnx_fallback = not getattr(args, "no_onnx_fallback", False)
-        encoder = make_encoder(encoder_kind, onnx_fallback=onnx_fallback)
-        if encoder is None:
-            print(f"  [skip] cell {name}: encoder '{encoder_kind}' unavailable. "
-                  f"Install its deps to run this cell.")
-            return None
+        if args.encoder == "synthetic":
+            # Force-synthetic regardless of cell - useful for harness sanity runs.
+            # Pick the dim that matches the cell's logical encoder.
+            encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else 256)
+        else:
+            onnx_fallback = not getattr(args, "no_onnx_fallback", False)
+            encoder = make_encoder(encoder_kind, onnx_fallback=onnx_fallback)
+            if encoder is None:
+                print(f"  [skip] cell {name}: encoder '{encoder_kind}' unavailable. "
+                      f"Install its deps to run this cell.")
+                return None
+        corpus_emb = None
+        if reuse:
+            encoder_cache[encoder_kind] = (encoder, None)
 
     work_dir = os.path.join(args.workdir, f"cell_{name}")
+    # Per-cell overrides (e.g. an M-sweep cell sets its own hnsw_m) fall back
+    # to the global CLI defaults.
     data_manager, faiss_path, sqlite_path = setup_cell(
         encoder=encoder,
         index_kind=spec["index"],
         work_dir=work_dir,
         similarity_threshold=args.threshold,
         max_size=max(args.scale * 2, 100_000),
+        hnsw_m=spec.get("hnsw_m", args.hnsw_m),
+        m_pq=spec.get("m_pq", args.m_pq),
+        k_factor=spec.get("k_factor", args.k_factor),
     )
 
     db_q, tp_q, fp_q = data
@@ -539,8 +599,22 @@ def run_cell(spec, data, args, threads):
     print(f"  TP queries   : {len(tp_q)}")
     print(f"  FP queries   : {len(fp_q)}")
 
-    ingest_s = ingest(encoder, db_q, batch_size=args.ingest_batch)
-    print(f"  Ingest time  : {ingest_s:.2f}s ({len(db_q)/max(ingest_s,1e-9):.0f} vec/s)")
+    encode_s = 0.0
+    precomputed = None
+    if reuse:
+        if corpus_emb is None:
+            te0 = time.perf_counter()
+            corpus_emb = encode_corpus(encoder, db_q, args.ingest_batch)
+            encode_s = time.perf_counter() - te0
+            encoder_cache[encoder_kind] = (encoder, corpus_emb)
+        precomputed = corpus_emb
+
+    ingest_s = ingest(encoder, db_q, data_manager,
+                      batch_size=args.ingest_batch, precomputed=precomputed)
+    total_ingest_s = encode_s + ingest_s
+    print(f"  Ingest time  : {total_ingest_s:.2f}s "
+          f"({len(db_q)/max(total_ingest_s,1e-9):.0f} vec/s)"
+          + ("" if encode_s or not reuse else "  [reused embeddings]"))
 
     metrics = measure_cell(
         encoder=encoder,
@@ -601,7 +675,7 @@ def run_cell(spec, data, args, threads):
         "label": spec["label"],
         "encoder": encoder.label,
         "index": spec["index"],
-        "ingest_seconds": ingest_s,
+        "ingest_seconds": total_ingest_s,
         "metrics": metrics,
         "memory": mem,
         "exact_match": exact_match_metrics,
@@ -635,10 +709,21 @@ def main():
     p.add_argument("--threads", type=int, default=_DEFAULT_THREADS,
                    help="faiss.omp_set_num_threads value (default $GPTCACHE_FAISS_THREADS or 1)")
     p.add_argument("--cells", default="A,B,C,D",
-                   help="comma-separated cell names to run")
+                   help="comma-separated cell names to run (E/F=PQ, G/H=M-sweep)")
+    p.add_argument("--hnsw-m", type=int, default=32, dest="hnsw_m",
+                   help="HNSW graph degree M for hnsw_* cells (per-cell spec may override)")
+    p.add_argument("--m-pq", type=int, default=32, dest="m_pq",
+                   help="PQ sub-quantizer count = bytes/code for hnsw_pq[_refine] cells")
+    p.add_argument("--k-factor", type=int, default=4, dest="k_factor",
+                   help="IndexRefineFlat over-fetch factor for hnsw_pq_refine cells")
     p.add_argument("--no-onnx-fallback", action="store_true", default=False,
                    help="disable PyTorch SBERT-768 fallback for cells A/B when "
                         "the ONNX dynamic-batch model is unavailable")
+    p.add_argument("--no-reuse-embeddings", action="store_true", default=False,
+                   help="disable sharing ingest embeddings across cells that use "
+                        "the same encoder (all MRL cells). Reuse skips redundant "
+                        "encode passes; query-time encoding is always real, so "
+                        "search latency and recall are unaffected.")
     p.add_argument("--workdir", default="bench_work",
                    help="directory for per-cell sqlite + faiss files")
     p.add_argument("--out", default=None,
@@ -681,8 +766,9 @@ def main():
 
     selected = [c for c in CELLS if c["name"] in set(args.cells.split(","))]
     results = []
+    encoder_cache = {}  # encoder_kind -> (encoder, corpus_embeddings | None)
     for spec in selected:
-        out = run_cell(spec, data, args, args.threads)
+        out = run_cell(spec, data, args, args.threads, encoder_cache)
         if out is not None:
             results.append(out)
 
@@ -706,6 +792,7 @@ def main():
         )
 
     out_path = args.out or os.path.join(args.workdir, "results.json")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump({
             "args": vars(args),
