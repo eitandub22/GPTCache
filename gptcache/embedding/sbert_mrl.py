@@ -1,4 +1,3 @@
-import numpy as np
 from gptcache.utils import import_sbert
 from gptcache.embedding.base import BaseEmbedding
 
@@ -63,16 +62,12 @@ class SBERTMRL(BaseEmbedding):
         """
         if not isinstance(data, list):
             data = [data]
-        emb = self.model.encode(data)
+        # native MRL: truncate_dim slices to target, normalize_embeddings re-L2-norms
+        emb = self.model.encode(
+            data, truncate_dim=self._target_dim, normalize_embeddings=True
+        )
 
-        # MRL truncation: slice to target dimension
-        truncated = emb[:, :self._target_dim]
-
-        # L2-normalize after truncation (critical for cosine similarity)
-        norms = np.linalg.norm(truncated, axis=1, keepdims=True)
-        normalized = truncated / np.maximum(norms, 1e-9)
-
-        result = normalized.astype("float32")
+        result = emb.astype("float32")
         # Return (dim,) for a single string, (N, dim) for a batch
         return result.squeeze(0) if result.shape[0] == 1 else result
 

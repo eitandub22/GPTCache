@@ -227,7 +227,7 @@ def make_encoder(kind, *, dim=None, onnx_fallback=True):
         if SBERTMRL is None:
             return None
         try:
-            enc = SBERTMRL(target_dim=256)
+            enc = SBERTMRL(target_dim=dim or 256)
             enc.label = f"mrl-{enc.dimension}d"
             return enc
         except Exception as e:  # noqa: BLE001
@@ -373,8 +373,31 @@ def ingest(encoder, db_questions, data_manager, batch_size=64, precomputed=None)
 # Measurement
 # ---------------------------------------------------------------------------
 
+def _sweep_thresholds(tp_scores, fp_scores, min_r, max_r, thresholds):
+    """Recompute TP/FP/precision at each candidate threshold from cached query
+    scores. The index is searched once; only the accept cutoff moves, so this is
+    free - no re-ingest, no re-search. Answers "is MRL's high FP just a
+    mis-tuned global threshold?" by giving a precision/recall curve per cell."""
+    tp = np.asarray(tp_scores, dtype=np.float64)
+    fp = np.asarray(fp_scores, dtype=np.float64)
+    rows = []
+    for t in thresholds:
+        cut = (max_r - min_r) * t
+        tp_hits = int((tp >= cut).sum())
+        fp_hits = int((fp >= cut).sum())
+        denom = tp_hits + fp_hits
+        rows.append({
+            "threshold": t,
+            "tp_hit_rate": tp_hits / max(tp.size, 1),
+            "fp_hit_rate": fp_hits / max(fp.size, 1),
+            "precision": (tp_hits / denom) if denom else 0.0,
+        })
+    return rows
+
+
 def measure_cell(encoder, data_manager, tp_queries, fp_queries,
-                 similarity_threshold, warmup, repeats, top_k=1):
+                 similarity_threshold, warmup, repeats, top_k=1,
+                 threshold_sweep=None):
     """Run TP + FP query sets with warmup and repeats.
 
     Returns dict with:
@@ -398,6 +421,8 @@ def measure_cell(encoder, data_manager, tp_queries, fp_queries,
     pooled_search = []
     pooled_e2e = []
     per_repeat = []
+    tp_scores = []  # raw match scores, captured once (rep 0) for the threshold sweep
+    fp_scores = []
 
     for rep in range(repeats):
         search_ms = []
@@ -415,6 +440,7 @@ def measure_cell(encoder, data_manager, tp_queries, fp_queries,
             search_ms.append((ts1 - ts0) * 1000.0)
 
             hit = False
+            score = None
             if res:
                 distance, cid = res[0]
                 score = evaluator.evaluation({}, {"search_result": (distance, cid)})
@@ -426,6 +452,10 @@ def measure_cell(encoder, data_manager, tp_queries, fp_queries,
                 tp_hits += 1
             elif (not tp) and hit:
                 fp_hits += 1
+            if rep == 0:
+                # No result => never a hit at any threshold.
+                s = score if score is not None else float("-inf")
+                (tp_scores if tp else fp_scores).append(s)
 
         pooled_search.extend(search_ms)
         pooled_e2e.extend(e2e_ms)
@@ -436,12 +466,17 @@ def measure_cell(encoder, data_manager, tp_queries, fp_queries,
             "fp_hits": fp_hits,
         })
 
+    sweep = None
+    if threshold_sweep:
+        sweep = _sweep_thresholds(tp_scores, fp_scores, min_r, max_r, threshold_sweep)
+
     return {
         "tp_hit_rate": per_repeat[-1]["tp_hits"] / max(len(tp_queries), 1),
         "fp_hit_rate": per_repeat[-1]["fp_hits"] / max(len(fp_queries), 1),
         "search_latency_ms": _percentiles(pooled_search),
         "e2e_latency_ms": _percentiles(pooled_e2e),
         "per_repeat": per_repeat,
+        "threshold_sweep": sweep,
     }
 
 
@@ -549,6 +584,9 @@ CELLS = [
     {"name": "F", "label": "MRL/256/HNSW+PQ+Refine", "encoder": "mrl", "index": "hnsw_pq_refine"},
     {"name": "G", "label": "MRL/256/HNSW+SQ8 (M=16)", "encoder": "mrl", "index": "hnsw_sq8", "hnsw_m": 16},
     {"name": "H", "label": "MRL/256/HNSW+SQ8 (M=24)", "encoder": "mrl", "index": "hnsw_sq8", "hnsw_m": 24},
+    # Isolation cell: nomic at FULL 768d + flat. Separates the precision cost of
+    # MRL *truncation* (256d) from the *encoder + threshold* (vs ONNX baseline A).
+    {"name": "I", "label": "MRL/768/Flat", "encoder": "mrl", "index": "flat", "mrl_dim": 768},
 ]
 
 
@@ -557,25 +595,29 @@ def run_cell(spec, data, args, threads, encoder_cache):
     print(f"\n=== Cell {name} - {spec['label']} ===")
 
     encoder_kind = spec["encoder"]
+    mrl_dim = spec.get("mrl_dim", 256)
+    # Cache key must include the MRL dim so the 256d and 768d cells don't share
+    # an encoder (different output dimension, different index).
+    enc_key = f"mrl{mrl_dim}" if encoder_kind == "mrl" else encoder_kind
     reuse = not args.no_reuse_embeddings
-    cached = encoder_cache.get(encoder_kind) if reuse else None
+    cached = encoder_cache.get(enc_key) if reuse else None
     if cached is not None:
         encoder, corpus_emb = cached
     else:
         if args.encoder == "synthetic":
             # Force-synthetic regardless of cell - useful for harness sanity runs.
             # Pick the dim that matches the cell's logical encoder.
-            encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else 256)
+            encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else mrl_dim)
         else:
             onnx_fallback = not getattr(args, "no_onnx_fallback", False)
-            encoder = make_encoder(encoder_kind, onnx_fallback=onnx_fallback)
+            encoder = make_encoder(encoder_kind, dim=mrl_dim, onnx_fallback=onnx_fallback)
             if encoder is None:
                 print(f"  [skip] cell {name}: encoder '{encoder_kind}' unavailable. "
                       f"Install its deps to run this cell.")
                 return None
         corpus_emb = None
         if reuse:
-            encoder_cache[encoder_kind] = (encoder, None)
+            encoder_cache[enc_key] = (encoder, None)
 
     work_dir = os.path.join(args.workdir, f"cell_{name}")
     # Per-cell overrides (e.g. an M-sweep cell sets its own hnsw_m) fall back
@@ -606,7 +648,7 @@ def run_cell(spec, data, args, threads, encoder_cache):
             te0 = time.perf_counter()
             corpus_emb = encode_corpus(encoder, db_q, args.ingest_batch)
             encode_s = time.perf_counter() - te0
-            encoder_cache[encoder_kind] = (encoder, corpus_emb)
+            encoder_cache[enc_key] = (encoder, corpus_emb)
         precomputed = corpus_emb
 
     ingest_s = ingest(encoder, db_q, data_manager,
@@ -616,6 +658,8 @@ def run_cell(spec, data, args, threads, encoder_cache):
           f"({len(db_q)/max(total_ingest_s,1e-9):.0f} vec/s)"
           + ("" if encode_s or not reuse else "  [reused embeddings]"))
 
+    sweep_list = ([float(x) for x in args.threshold_sweep.split(",")]
+                  if getattr(args, "threshold_sweep", None) else None)
     metrics = measure_cell(
         encoder=encoder,
         data_manager=data_manager,
@@ -624,6 +668,7 @@ def run_cell(spec, data, args, threads, encoder_cache):
         similarity_threshold=args.threshold,
         warmup=args.warmup,
         repeats=args.repeats,
+        threshold_sweep=sweep_list,
     )
 
     # Optional: exercise the Step 4 exact-match shortcut on a slice of the
@@ -661,6 +706,13 @@ def run_cell(spec, data, args, threads, encoder_cache):
           f"  (serialize_index)")
     print(f"  FAISS disk   : {mem['faiss_disk_bytes']/1e6:.2f} MB")
     print(f"  SQLite disk  : {mem['sqlite_disk_bytes']/1e6:.2f} MB")
+
+    if metrics.get("threshold_sweep"):
+        print("  Thr sweep    : thr ->  TP%   FP%  prec%")
+        for row in metrics["threshold_sweep"]:
+            print(f"                 {row['threshold']:.2f} -> "
+                  f"{row['tp_hit_rate']*100:5.1f} {row['fp_hit_rate']*100:5.1f} "
+                  f"{row['precision']*100:5.1f}")
 
     if exact_match_metrics is not None:
         bm = exact_match_metrics["baseline_ms"]
@@ -701,6 +753,11 @@ def main():
                    help="qqp requires HuggingFace `datasets`; synthetic uses generated pairs")
     p.add_argument("--threshold", type=float, default=0.90,
                    help="similarity_threshold (default 0.90)")
+    p.add_argument("--threshold-sweep", default=None, dest="threshold_sweep",
+                   help="comma-separated thresholds to re-score each cell at, e.g. "
+                        "'0.85,0.88,0.90,0.92,0.95'. Reuses the single search pass "
+                        "(no re-ingest); emits a precision/recall curve per cell so "
+                        "you can compare cells at matched precision, not one global cut.")
     p.add_argument("--ingest-batch", type=int, default=64)
     p.add_argument("--warmup", type=int, default=20,
                    help="queries to discard from latency stats (BP5)")
@@ -709,7 +766,8 @@ def main():
     p.add_argument("--threads", type=int, default=_DEFAULT_THREADS,
                    help="faiss.omp_set_num_threads value (default $GPTCACHE_FAISS_THREADS or 1)")
     p.add_argument("--cells", default="A,B,C,D",
-                   help="comma-separated cell names to run (E/F=PQ, G/H=M-sweep)")
+                   help="comma-separated cell names to run (E/F=PQ, G/H=M-sweep, "
+                        "I=MRL/768/flat truncation-isolation cell)")
     p.add_argument("--hnsw-m", type=int, default=32, dest="hnsw_m",
                    help="HNSW graph degree M for hnsw_* cells (per-cell spec may override)")
     p.add_argument("--m-pq", type=int, default=32, dest="m_pq",
