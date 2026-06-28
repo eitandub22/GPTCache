@@ -425,3 +425,22 @@ def test_resize_window_conserves_capacity():
     cache._resize_window(-5)                            # clamp low
     assert cache._window.maxsize >= 1
     _assert_window_invariants(cache, maxsize)
+
+
+def test_cost_priority_maps_to_freq_weight():
+    """cost_priority is the [0,1] money<->hit-rate dial mapped onto freq_weight.
+
+    0.0 => 16 (frequency dominates, max hit rate); 1.0 => 1 (cost equal-footed,
+    max money saved); linear between; out-of-range rejected; None is a no-op.
+    """
+    assert CostAwareWTinyLFU(maxsize=40, cost_priority=0.0)._freq_weight == 16.0
+    assert CostAwareWTinyLFU(maxsize=40, cost_priority=1.0)._freq_weight == 1.0
+    assert CostAwareWTinyLFU(maxsize=40, cost_priority=0.5)._freq_weight == 8.5
+    # None leaves the raw freq_weight untouched
+    assert CostAwareWTinyLFU(maxsize=40, freq_weight=4.0)._freq_weight == 4.0
+    for bad in (-0.1, 1.5):
+        try:
+            CostAwareWTinyLFU(maxsize=40, cost_priority=bad)
+            assert False, f"cost_priority={bad} should have raised"
+        except ValueError:
+            pass

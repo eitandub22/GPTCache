@@ -326,6 +326,7 @@ class CostAwareWTinyLFU:
         default_cost: Optional[LLMCost] = None,
         cost_aware: bool = True,
         freq_weight: float = 16.0,
+        cost_priority: Optional[float] = None,
         adaptive_window: bool = False,
         adapt_sample_factor: float = 10.0,
         adapt_step_ratio: float = 0.0625,
@@ -351,6 +352,16 @@ class CostAwareWTinyLFU:
         # original lexicographic behaviour; lower values blend cost into the
         # decision so it influences eviction beyond mere tie-breaking.
         self._cost_aware = cost_aware
+        # cost_priority is the user-facing money<->hit-rate dial in [0, 1].
+        # 0.0 => freq_weight 16 (lexicographic: frequency dominates, cost only
+        # breaks ties => maximize hit rate, spend freely on regeneration).
+        # 1.0 => freq_weight 1 (cost on equal footing with frequency =>
+        # maximize money saved by keeping expensive answers). Overrides
+        # freq_weight when set; None keeps the raw freq_weight for backward compat.
+        if cost_priority is not None:
+            if not 0.0 <= cost_priority <= 1.0:
+                raise ValueError("cost_priority must be in [0, 1]")
+            freq_weight = 16.0 - 15.0 * cost_priority
         self._freq_weight = freq_weight
 
         self._protected_ratio = protected_ratio

@@ -99,7 +99,7 @@ class ConvEntry:
 # Dataset loaders
 # ---------------------------------------------------------------------------
 def _count_tokens(text: str, enc) -> int:
-    return len(enc.encode(text))
+    return len(enc.encode(text, disallowed_special=()))
 
 
 def _stream_entries(dataset, split, msgs_key, model_fn, tier_fn, n) -> List[ConvEntry]:
@@ -416,6 +416,11 @@ def main():
     p.add_argument("--sweep",        action="store_true",
                    help="Sweep window_ratio x freq_weight for CA_W_TINYLFU "
                         "(ignores --window-ratio/--freq-weight for that policy)")
+    p.add_argument("--cost-priority-sweep", default=None,
+                   help="Comma-separated cost_priority values in [0,1] to sweep "
+                        "for CA_W_TINYLFU (e.g. '0,0.25,0.5,0.75,1'). 0=maximize "
+                        "hit rate, 1=maximize money saved. Plots the tradeoff "
+                        "curve; takes precedence over --sweep for that policy.")
     p.add_argument("--adaptive-window", action="store_true",
                    help="Also run a CA_W_TINYLFU_ADAPT variant whose window<->main "
                         "boundary self-tunes via a Caffeine-style hill-climb on the "
@@ -463,7 +468,14 @@ def main():
     specs: List[Tuple[str, str, Optional[dict]]] = []
     for pol in policies:
         if pol == "CA_W_TINYLFU":
-            if args.sweep:
+            if args.cost_priority_sweep:
+                for cp in [float(x) for x in args.cost_priority_sweep.split(",") if x.strip()]:
+                    specs.append((
+                        f"CA_cp{cp:g}", "CA_W_TINYLFU",
+                        {"window_ratio": args.window_ratio,
+                         "cost_priority": cp, "cost_aware": True},
+                    ))
+            elif args.sweep:
                 for wr in SWEEP_WINDOW:
                     for fw in SWEEP_FREQW:
                         specs.append((
@@ -507,7 +519,7 @@ def main():
         mode = (f"rotate {100*args.drift_shift:g}% every {args.drift_rotate}q"
                 if args.drift_rotate > 0 else "static Zipf")
         print(f"  Drift stream     : {args.drift_queries} queries, "
-              f"Zipf α={args.drift_zipf}, {mode}")
+              f"Zipf a={args.drift_zipf}, {mode}")
     print(f"  Repeats          : {args.repeats}")
     print(f"  Embedding model  : {EMBED_MODEL} ({EMBED_DIM}d)")
 
