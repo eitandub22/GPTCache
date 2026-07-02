@@ -152,6 +152,21 @@ def load_lmsys(n: int, seed: int) -> List[ConvEntry]:
     )
 
 
+def load_wildchat(n: int, seed: int) -> List[ConvEntry]:
+    """Stream first `n` valid first-turn exchanges from WildChat-1M.
+
+    Same shape as LMSYS (per-row `model` field, `conversation` message list),
+    so it reuses _model_tier for cost tiers. Gated: needs HF access to
+    allenai/WildChat-1M.
+    """
+    return _stream_entries(
+        "allenai/WildChat-1M", "train", "conversation",
+        model_fn=lambda row: row.get("model", ""),
+        tier_fn=lambda r_tok, model: _model_tier(model),
+        n=n,
+    )
+
+
 def load_ultrachat(n: int, seed: int) -> List[ConvEntry]:
     """Stream first `n` valid first-turn exchanges from UltraChat-200K."""
     # UltraChat has no model field — assign tier by response length.
@@ -396,8 +411,8 @@ def main():
     p = argparse.ArgumentParser(
         description="Full-stack LLM conversation benchmark")
     p.add_argument("--dataset",      default="ultrachat",
-                   choices=["ultrachat", "lmsys"],
-                   help="Dataset to use (default: ultrachat; lmsys requires HF gated access)")
+                   choices=["ultrachat", "lmsys", "wildchat"],
+                   help="Dataset to use (default: ultrachat; lmsys/wildchat require HF gated access)")
     p.add_argument("--n-queries",    type=int, default=3000,
                    help="Number of conversation entries to load (default: 3000)")
     p.add_argument("--cache-sizes",  default="50,100,200",
@@ -525,7 +540,8 @@ def main():
 
     # ---- Load data ----
     print(f"\nLoading {args.dataset} data ...")
-    loader = load_lmsys if args.dataset == "lmsys" else load_ultrachat
+    loader = {"lmsys": load_lmsys, "wildchat": load_wildchat}.get(
+        args.dataset, load_ultrachat)
     entries = loader(args.n_queries, args.seed)
     print(f"  Loaded {len(entries)} entries")
 
