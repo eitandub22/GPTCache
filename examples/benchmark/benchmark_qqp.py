@@ -179,10 +179,11 @@ class _SBERT768Encoder(_BaseEncoder):
         return result.squeeze(0) if result.shape[0] == 1 else result
 
 
-def make_encoder(kind, *, dim=None, onnx_fallback=True):
+def make_encoder(kind, *, dim=None, onnx_fallback=True, model=None):
     """Build the encoder for a cell. Returns None if its deps aren't available.
 
-    kind in {"onnx", "mrl", "synthetic"}.
+    kind in {"onnx", "mrl", "synthetic"}. `model` overrides the MRL model name
+    (e.g. static-retrieval-mrl-en-v1 for a zero-transformer, ~0ms encoder).
     onnx_fallback: if True, fall back to the PyTorch SBERT-768 encoder when
                    the ONNX model is unavailable (e.g. no dynamic-batch export).
     """
@@ -227,7 +228,8 @@ def make_encoder(kind, *, dim=None, onnx_fallback=True):
         if SBERTMRL is None:
             return None
         try:
-            enc = SBERTMRL(target_dim=dim or 256)
+            enc = (SBERTMRL(model, target_dim=dim or 256) if model
+                   else SBERTMRL(target_dim=dim or 256))
             enc.label = f"mrl-{enc.dimension}d"
             return enc
         except Exception as e:  # noqa: BLE001
@@ -587,6 +589,11 @@ CELLS = [
     # Isolation cell: nomic at FULL 768d + flat. Separates the precision cost of
     # MRL *truncation* (256d) from the *encoder + threshold* (vs ONNX baseline A).
     {"name": "I", "label": "MRL/768/Flat", "encoder": "mrl", "index": "flat", "mrl_dim": 768},
+    # Static encoder: token-embedding lookup, no transformer forward → ~0ms encode,
+    # killing the e2e-latency cost that the nomic MRL encoder pays (frontier.md note 5).
+    # Same MRL/256/HNSW+PQ index as cell E for an apples-to-apples compression compare.
+    {"name": "J", "label": "StaticMRL/256/HNSW+PQ", "encoder": "mrl", "index": "hnsw_pq",
+     "mrl_model": "sentence-transformers/static-retrieval-mrl-en-v1"},
 ]
 
 
@@ -598,7 +605,9 @@ def run_cell(spec, data, args, threads, encoder_cache):
     mrl_dim = spec.get("mrl_dim", 256)
     # Cache key must include the MRL dim so the 256d and 768d cells don't share
     # an encoder (different output dimension, different index).
-    enc_key = f"mrl{mrl_dim}" if encoder_kind == "mrl" else encoder_kind
+    mrl_model = spec.get("mrl_model")
+    enc_key = (f"mrl{mrl_dim}:{mrl_model or 'nomic'}"
+               if encoder_kind == "mrl" else encoder_kind)
     reuse = not args.no_reuse_embeddings
     cached = encoder_cache.get(enc_key) if reuse else None
     if cached is not None:
@@ -610,7 +619,8 @@ def run_cell(spec, data, args, threads, encoder_cache):
             encoder = SyntheticEncoder(768 if encoder_kind == "onnx" else mrl_dim)
         else:
             onnx_fallback = not getattr(args, "no_onnx_fallback", False)
-            encoder = make_encoder(encoder_kind, dim=mrl_dim, onnx_fallback=onnx_fallback)
+            encoder = make_encoder(encoder_kind, dim=mrl_dim,
+                                   onnx_fallback=onnx_fallback, model=mrl_model)
             if encoder is None:
                 print(f"  [skip] cell {name}: encoder '{encoder_kind}' unavailable. "
                       f"Install its deps to run this cell.")

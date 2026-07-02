@@ -17,6 +17,7 @@ that scales; "vs A" is index-RAM compression against the ONNX/768/Flat baseline.
 | H | MRL/256/HNSW+SQ8 (M=24) | 472 | 6.5× | 98.85 | 40.85 | 70.8 | 0.314 | dominated |
 | G | MRL/256/HNSW+SQ8 (M=16) | 408 | 7.5× | 98.85 | 40.80 | 70.8 | 0.285 | **on frontier** |
 | E | MRL/256/HNSW+PQ | 315 | 9.8× | 95.40 | 24.80 | 79.4 | 0.190 | **on frontier** |
+| J | StaticMRL/256/HNSW+PQ | 315 | 9.8× | 65.30 | 8.15 | 88.9 | 0.133 | frontier (e2e-latency) |
 
 \* precision proxy = TP/(TP+FP) at equal TP/FP query counts (2000 each).
 
@@ -82,12 +83,12 @@ claws precision back while still hitting 9.8× compression.
 
 ## Per-cell threshold sweep (TP / FP / precision)
 
-| thr | A TP/FP/prec | E TP/FP/prec | G TP/FP/prec | I TP/FP/prec |
-|---:|---|---|---|---|
-| 0.88 | .933/.237/.798 | .978/.421/.699 | .995/.597/.625 | .995/.473/.678 |
-| 0.90 | .892/.185/.828 | .953/.248/.793 | .989/.408/.708 | .980/.329/.749 |
-| 0.92 | .822/.146/.849 | .882/.139/.864 | .967/.273/.780 | .948/.231/.804 |
-| 0.94 | .733/.113/.866 | .695/.075/.903 | .900/.174/.838 | .877/.160/.846 |
+| thr | A TP/FP/prec | E TP/FP/prec | G TP/FP/prec | I TP/FP/prec | J TP/FP/prec |
+|---:|---|---|---|---|---|
+| 0.88 | .933/.237/.798 | .978/.421/.699 | .995/.597/.625 | .995/.473/.678 | .753/.122/.861 |
+| 0.90 | .892/.185/.828 | .953/.248/.793 | .989/.408/.708 | .980/.329/.749 | .653/.082/.889 |
+| 0.92 | .822/.146/.849 | .882/.139/.864 | .967/.273/.780 | .948/.231/.804 | .492/.040/.925 |
+| 0.94 | .733/.113/.866 | .695/.075/.903 | .900/.174/.838 | .877/.160/.846 | .164/.004/.973 |
 
 ## Honesty note 5 — e2e latency reverses the search win
 
@@ -97,3 +98,12 @@ the nomic MRL encoder is slower per query than the ONNX/sbert768 encoder, and em
 (~97 ms for MRL/256 vs ~27 ms encode for the baseline; search is ≤0.3 ms either way). So the 100×
 search win is real but **invisible at e2e** under this encoder pairing; the compression and search-CPU
 wins are the bankable ones, latency is not. Quote search-p95 for the search claim, e2e-p95 separately.
+
+**Follow-up — Cell J makes the e2e win bankable too.** Swapping the nomic encoder for
+`static-retrieval-mrl-en-v1` (token-embedding lookup, no transformer forward) at the *same* MRL/256/
+HNSW+PQ index collapses **e2e p95 from 97.5 ms → 0.50 ms** (search p95 0.13 ms; e2e is now search +
+SQLite-bound, not encoder-bound) at **identical 9.8× / 315 B/vec** compression. The cost is recall:
+J is a weaker encoder, **−12.9pp TP at matched precision ≈0.86** (E @0.92 TP .882/prec .864 vs
+J @0.88 TP .753/prec .861), and it trails even baseline A there (A @0.92 TP .822/prec .849). So the
+frontier has a third operating point: **A** = recall+latency, no compression; **E/G** = compression,
+encoder-bound e2e; **J** = compression **and** sub-ms e2e, paid for in recall.
