@@ -108,6 +108,43 @@ def crossover():
     print("wrote", p)
 
 
+def gdsf_headtohead():
+    # CA - GDSF paired cost_wt delta (pp) at cs100, lmsys, n=7, verified via paired.py.
+    # CI = paired-t 95% half-width. Green only where the CI clears zero (a real win).
+    labels = ["Drift\nflat (z11)", "Drift\ndefault (z12)",
+              "Stationary\nsharp (z15)", "Stationary\nflat (z11)"]
+    vals = [-0.43, 0.39, -1.50, 4.56]
+    cis = [2.68, 4.71, 4.90, 3.41]
+    wins = [(v - c) > 0 for v, c in zip(vals, cis)]  # CI excludes zero
+
+    fig, ax = plt.subplots(figsize=(8.2, 4.6))
+    colors = ["#1a7f37" if w else "#9aa0a6" for w in wins]
+    bars = ax.bar(range(len(vals)), vals, yerr=cis, capsize=5, color=colors,
+                  width=0.6, edgecolor="#222", linewidth=0.6,
+                  error_kw=dict(ecolor="#444", lw=1.1))
+    ax.axhline(0, color="#222", lw=1.0)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("CA $-$ GDSF cost-weighted advantage (pp)", fontsize=9.5)
+    ax.set_title("Head-to-head vs GDSF: CA overtakes the cost-aware baseline\n"
+                 "only under flat stationary skew (cs100, paired $n=7$, 95% CI)", fontsize=10.5)
+    for b, v, c in zip(bars, vals, cis):
+        ax.text(b.get_x() + b.get_width() / 2, v + c + 0.25 if v >= 0 else v - c - 0.25,
+                f"{v:+.2f}", ha="center", va="bottom" if v >= 0 else "top",
+                fontsize=9, fontweight="bold")
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(facecolor="#1a7f37", edgecolor="#222", label="CA beats GDSF (CI excludes 0)"),
+                       Patch(facecolor="#9aa0a6", edgecolor="#222", label="tie (CI spans 0)")],
+              loc="upper left", fontsize=8.5, frameon=False)
+    ax.margins(y=0.20)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    p = os.path.join(OUT, "fig_gdsf.png")
+    fig.savefig(p, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print("wrote", p)
+
+
 if __name__ == "__main__":
     request_flow()
     crossover()
+    gdsf_headtohead()
