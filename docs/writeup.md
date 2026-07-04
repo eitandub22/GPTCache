@@ -24,7 +24,7 @@
 
 Semantic caches for large language models store past answers and serve them for queries that are close
 enough in embedding space, avoiding a real LLM call on a hit. But not all misses cost the same: a miss
-on a long GPT-4 answer is far more expensive to regenerate than a miss on a short open-weights reply, so
+on a long GPT-5 answer is far more expensive to regenerate than a miss on a short open-weights reply, so
 raw hit rate is the wrong objective for an LLM cache and cost-weighted hit rate is the right one. GPTCache,
 the reference open-source semantic cache, ships only cost-blind recency and frequency eviction (cachetools
 LRU/LFU). We add CA_W_TINYLFU, a cost-aware W-TinyLFU policy that folds a per-answer regeneration cost
@@ -34,7 +34,7 @@ decay and an adaptive window for the drifting-workload case. Measured with paire
 cost-weighted hit rate in both regimes a cache faces: under a drifting hot set, with decay on, adaptive
 CA_W_TINYLFU beats LRU by +3.6 to +4.1pp (7/7 seeds, Wilcoxon p = 0.016); under stationary skew it beats
 LRU in all 42 cells tested (+4.6 to +15.9pp), replicated on a second dataset. Against GDSF, the classic
-cost-aware policy and our closest prior art, CA_W_TINYLFU _beats_ cost-weighted hit rate by +5.0pp (7/7)
+cost-aware policy and our closest prior art, CA_W_TINYLFU _beats_ cost-weighted hit rate by +4.6pp (7/7)
 under flat stationary skew and ties under drift and sharp skew, while also exposing a tunable
 `cost_priority` dial GDSF has no equivalent for. We are deliberately honest about scope: an isolation ablation
 shows the cost term itself pays under sharp skew but is within noise under flat skew, and a user-facing
@@ -51,7 +51,7 @@ expensive generation into cheap approximate lookup, and GPTCache is the referenc
 implementation of the pattern [GPTCache]. Like any cache of bounded size, it must eventually evict, and eviction is
 where an LLM cache differs from a page or object cache in a way that matters.
 
-The difference is that LLM answers have **heterogeneous regeneration cost**. Evicting a cached GPT-4
+The difference is that LLM answers have **heterogeneous regeneration cost**. Evicting a cached GPT-5
 answer that took thousands of output tokens and seconds of latency to produce is not the same as
 evicting a short reply from a small open-weights model: if either is missed later, the first costs far
 more to regenerate. A policy that maximizes hit *rate* treats those two evictions as equal. The right
@@ -137,7 +137,7 @@ baseline-weakness → fix steps.
 ### 4.1 Cost model: reaching the policy with a real regeneration cost
 
 **Weakness.** The shipped policies decide what to keep from access pattern alone; they cannot see that a
-cache miss on a GPT-4 answer costs far more to serve than a miss on a short open-weights reply.
+cache miss on a GPT-5 answer costs far more to serve than a miss on a short open-weights reply.
 
 **Fix.** Each cached answer carries an `LLMCost` object whose scalar is
 `generation_latency_ms × model_tier × (1 + token_count / 1000)`, folding wall-clock delay and pricing
@@ -268,7 +268,7 @@ Each cached answer carries a regeneration-cost scalar
 LLMCost = generation_latency_ms × model_tier × (1 + token_count / 1000)
 ```
 
-The **model tier** is read from the conversation's real model name: `gpt-4*` → 20, Claude family → 15,
+The **model tier** is read from the conversation's real model name: `gpt-5*` → 20, Claude family → 15,
 open-weights (`llama`/`vicuna`/`mistral`/`falcon`/…) → 0.5, everything else (gpt-3.5 and other hosted
 models) → 1.0. So cost heterogeneity is grounded in which model actually produced each answer, not
 synthesised. **Tokens are exact**; only the **latency term is modeled** (`base[tier] + 4 ms/token`), because a real 30 000-query × multi-seed × multi-policy replay against paid
@@ -456,8 +456,8 @@ The picture is regime-dependent, and in the regime where CA is strongest it is a
 α=1.1; +0.39 [4/7], p = 0.81 at α=1.2; the sign flips across seeds), with GDSF holding a small but
 sign-consistent raw-hit and token edge (0/7, p = 0.016 both). But under **stationary flat skew** (z11),
 the same regime where CA's margin over LRU is largest (7.2), CA **beats** GDSF on cost-weighted hit rate
-by **+5.05pp (7/7 seeds, p = 0.016, 95% CI [+1.8, +8.3])** and on token-saving by +2.15pp (7/7,
-p = 0.016), while raw hit rate is a wash, a whisker toward GDSF (−0.63, 2/7, p = 0.08, CI [−1.3, −0.0]).
+by **+4.56pp (7/7 seeds, p = 0.016, 95% CI [+1.2, +8.0])** and on token-saving by +2.14pp (7/7,
+p = 0.016), while raw hit rate is a wash (−0.89, 2/7, p = 0.08, CI [−1.8, +0.1] straddling zero).
 Under **stationary sharp skew** (z15) it returns to a tie (−1.50 [3/7], p = 0.94, CI ±4.9 spanning zero),
 where GDSF keeps a small sign-consistent raw-hit edge (−0.81, 0/7, p = 0.016). So CA does not
 merely match the cost-aware baseline: it ties GDSF under drift and sharp skew and _overtakes_ it under
@@ -477,7 +477,7 @@ the failed and the confirmed cell both.
 |---|---|---|---|
 | drift, α=1.1 | −0.43 [4/7] | −2.32 [0/7] | −1.16 [0/7] |
 | drift, α=1.2 | +0.39 [4/7] | −2.55 [0/7] | −0.88 [0/7] |
-| stationary flat (z11) | **+5.05 [7/7]** | −0.63 [2/7] | **+2.15 [7/7]** |
+| stationary flat (z11) | **+4.56 [7/7]** | −0.89 [2/7] | **+2.14 [7/7]** |
 | stationary sharp (z15) | −1.50 [3/7] | −0.81 [0/7] | −0.39 [1/7] |
 
 **Robustness across cache size and dataset.** The cs100 result above is the headline, but the flat-skew
@@ -668,7 +668,7 @@ this by folding a per-answer regeneration cost into TinyLFU admission, and it be
 cost-weighted hit rate in both regimes a cache faces: under a drifting hot set, with read-time decay on,
 by +3.6 to +4.1pp (7/7 seeds, Wilcoxon p = 0.016); under stationary skew, in all 42 cells tested (+4.6 to
 +15.9pp), replicated on a second dataset. Against GDSF, the classic cost-aware baseline and our closest
-prior art, it _beats_ cost-weighted hit rate by +5.0pp (7/7) under flat stationary skew, where its
+prior art, it _beats_ cost-weighted hit rate by +4.6pp (7/7) under flat stationary skew, where its
 admission filter rejects the one-hit-wonder stream GDSF admits (the win holds across cs ∈ {25,50,100} and
 replicates on WildChat), and ties under drift and sharp skew,
 while also adding a cost dial, sketch-based frequency decoupled from residency, and an O(1) admission step
@@ -759,7 +759,7 @@ picture rather than a single headline.
 | stationary CA−LRU replicates on WildChat 42/42, z11 +19.3/+15.6/+12.6, z15 +9.1/+5.4/+2.2 (n=7)                         | bench_wildchat/win_z{11,15}\_seed0–6.json; paired.py                 |
 | cost-isolation regime-dependent (lmsys); cleaner on WildChat (5/6 cells 7/7 cost_wt)                                    | plan.md Phase 0.6 §Table 2; bench_wildchat/\*; paired.py CA−FREQ     |
 | GDSF head-to-head drift: CA−GDSF cost_wt tie α1.1 −0.43 [4/7] / α1.2 +0.39 [4/7]; GDSF wins hit & tok 0/7 both          | bench_lmsys/gdsf_z11_seed\*.json; gdsf_vc120_seed\*.json; paired.py CA−GDSF |
-| GDSF head-to-head stationary cs100 (n=7): CA−GDSF cost_wt z11 +5.05 [7/7] / z15 −1.50 [3/7]; tok z11 +2.15 [7/7]; hit z11 −0.63 [2/7] | bench_lmsys/gdsfstat_z{11,15}_seed\*.json; paired.py CA−GDSF |
+| GDSF head-to-head stationary cs100 (n=7): CA−GDSF cost_wt z11 +4.56 [7/7] / z15 −1.50 [3/7]; tok z11 +2.14 [7/7]; hit z11 −0.89 [2/7] | bench_lmsys/gdsfstat_z{11,15}_seed\*.json; paired.py CA−GDSF |
 | GDSF cache-size + WildChat sweep (n=5, seeds 0–4): flat z11 cost_wt + at every cs on both datasets (WildChat +3.60±0.60 cs100 [5/5]); sharp z15 tie on both | bench_{lmsys,wildchat}/gdsfstat_z{11,15}_seed[0-4].json; paired.py CA−GDSF |
 | decay is the drift lever                                                                                                | plan.md Phase 3; decay_vc{0,30,120}\_seed\*.json                     |
 | eviction plumbing / clean_size                                                                                          | research.md §1.2; memory_cache.py; ca_w_tinylfu.py                   |
