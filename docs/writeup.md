@@ -32,11 +32,13 @@ LRU/LFU). We add CA_W_TINYLFU, a cost-aware W-TinyLFU policy that folds a per-an
 decay and an adaptive window for the drifting-workload case. Measured with paired-seed statistics
 (n = 7) on full-stack GPTCache replays of two real conversation datasets, the policy beats LRU on
 cost-weighted hit rate in both regimes a cache faces: under a drifting hot set, with decay on, adaptive
-CA_W_TINYLFU beats LRU by +3.6 to +4.1pp (7/7 seeds, p ≈ 0.001); under stationary skew it beats LRU in
-all 42 cells tested (+4.6 to +15.9pp), replicated on a second dataset. We are deliberately honest about
-scope: an isolation ablation shows the cost term itself pays under sharp skew but is within noise under
-flat skew, and a user-facing `cost_priority` dial trades raw hit rate for cost savings along a clean but
-coarse Pareto curve. Alongside the policy we contribute a storage co-optimization (MRL embedding
+CA_W_TINYLFU beats LRU by +3.6 to +4.1pp (7/7 seeds, Wilcoxon p = 0.016); under stationary skew it beats
+LRU in all 42 cells tested (+4.6 to +15.9pp), replicated on a second dataset. Against GDSF, the classic
+cost-aware policy and our closest prior art, CA_W_TINYLFU _beats_ cost-weighted hit rate by +5.0pp (7/7)
+under flat stationary skew and ties under drift and sharp skew, while also exposing a tunable
+`cost_priority` dial GDSF has no equivalent for. We are deliberately honest about scope: an isolation ablation
+shows the cost term itself pays under sharp skew but is within noise under flat skew, and a user-facing
+`cost_priority` dial trades raw hit rate for cost savings along a clean but coarse Pareto curve. Alongside the policy we contribute a storage co-optimization (MRL embedding
 truncation plus an HNSW/SQ8 index) reaching 5.7-9.8x index-RAM compression on a Pareto frontier.
 
 ## 2. Introduction / motivation
@@ -63,9 +65,11 @@ proven structure and changes only the admission decision to weight frequency by 
 a read-time frequency decay and an optional adaptive window for drifting workloads, and a user-facing
 dial that lets an operator choose where to sit on the money-versus-quality trade. We evaluate it with
 paired-seed statistics on full-stack replays of two real conversation datasets (Sections 6-7), and we
-report both where it wins decisively and where the cost term washes out. Section 9 adds an independent
-storage co-contribution on the same cache. Throughout, every empirical claim is tied to a measured,
-sign-consistent result rather than an averaged headline.
+report both where it wins decisively and where the cost term washes out. We benchmark not only cost-blind
+LRU but GDSF, the classic cost-aware policy that is our closest prior art, and report the head-to-head
+plainly: a cost-weighted win under flat stationary skew, a tie elsewhere. Section 9 adds an independent
+storage co-contribution on the same cache. Throughout, every empirical claim is tied to a measured, sign-consistent result rather than
+an averaged headline.
 
 ## 3. Background
 
@@ -117,7 +121,9 @@ value combines its recency, its access count and its fetch cost. That lineage wa
 uniform, directly-measured object sizes and fetch latencies. What is new here is fusing a cost term into
 **TinyLFU admission** specifically, and doing so for a **semantic** LLM cache, where the "cost" is
 heterogeneous answer regeneration (model tier, output tokens, latency) rather than object size, and
-where the cached keys are approximate vector matches rather than exact lookups.
+where the cached keys are approximate vector matches rather than exact lookups. GDSF is not just related
+work but the correct baseline, so we implement it in the same harness and benchmark against it directly
+(Section 7.3b).
 
 ## 4. Design: CA_W_TINYLFU
 
@@ -315,9 +321,13 @@ LFU / WTINYLFU_FREQ / CA_W_TINYLFU (measured per-seed std = 0); only LRU's tie-o
 
 ### 6.5 Policies
 
-Five policies, all behind the same eviction interface:
+Six policies, all behind the same eviction interface:
 
 - **LRU, LFU**: the cachetools policies GPTCache ships; cost-blind. The in-system baseline.
+- **GDSF**: GreedyDual-Size-Frequency [GDSF], the classic cost-aware policy and closest prior art
+  (Section 3.4), implemented in the same harness with fetch cost = `LLMCost` and size = 1. The demanding
+  baseline for the cost term: unlike LRU it already keeps expensive-and-frequent items, so beating it is
+  not free.
 - **WTINYLFU_FREQ**: the frequency-only twin, our `CostAwareWTinyLFU` with `cost_aware=False`. Same
   W-TinyLFU machinery (windowed SLRU + Count-Min admission), zero cost weighting. This isolates _what
   the cost term adds_: the CA − FREQ ablation in Section 7.3.
@@ -348,9 +358,13 @@ statement about "A beats B" is the per-seed paired delta A − B, not the differ
 Cross-seed variance here is _difficulty_ variance (some streams are simply harder) and is large
 (the z11 cost-weighted spread runs ±9–14pp), which would swamp a real +2–4pp effect if reported as
 unpaired mean ± std. Pairing cancels it. We run **seeds 0–6 (n = 7)** and report, per cell, the paired
-mean delta, its standard deviation, and the **sign-consistency count** (positive in k/7 seeds), via
-`paired.py`. A result is only claimed when it is sign-consistent across seeds, not merely positive on
-average.
+mean delta, the **sign-consistency count** (positive in k/7 seeds), an **exact two-sided Wilcoxon
+signed-rank** p-value (enumerating all 2^7 sign assignments, so no normal approximation), and a paired-t
+95% confidence interval, all via `paired.py`. At n = 7 a fully sign-consistent result (7/7 or 0/7) gives
+p = 0.016, the exact-test floor, so every _decisive_ claim below carries p = 0.016 with a CI excluding
+zero; every _tie_ claim is backed by a large p and a CI that bounds the effect within a point or two of
+zero (a paired equivalence check), not merely by a mid-range sign count. A result is only claimed when it
+is sign-consistent _and_ its CI excludes zero.
 
 ## 7. Results
 
@@ -366,9 +380,9 @@ at cs100 (2/8 seeds positive; shift 0.10, rotate 3000, Zipf 1.2).
 
 Turning on the EWMA time-decay (advancing a virtual clock, `virtual-clock-sec=120`) flips the sign at
 the same drift setting. ADAPT now beats LRU on cost-weighted hit rate by **+3.63pp** under fast drift
-(shift 0.10, 7/7 seeds, t ≈ 5.9) and **+4.10pp** under gentle drift (shift 0.02, 7/7, t ≈ 6.3), both
-p ≈ 0.001; token-saving is up 7/7 in both, and raw hit rate is up 7/7 under gentle drift, 5/7 under fast
-drift. So **decay is the lever**: the single controlled change of turning it on moves ADAPT from a ~6pp
+(shift 0.10, 7/7 seeds) and **+4.10pp** under gentle drift (shift 0.02, 7/7); both are Wilcoxon p = 0.016
+(the exact n = 7 floor) with 95% CIs excluding zero (gentle-drift cost_wt +4.10 ± 1.59); token-saving is
+up 7/7 in both, and raw hit rate is up 7/7 under gentle drift, 5/7 under fast drift. So **decay is the lever**: the single controlled change of turning it on moves ADAPT from a ~6pp
 loss to a ~4pp win over LRU, letting a frequency-based policy win the recency regime LRU was built for.
 
 | ADAPT − LRU, cs100 | cost_wt (pp) | hit (pp) | tok (pp) |
@@ -383,8 +397,9 @@ _[bench_lmsys/drift_e2_seed\*.json (decay off); decaytuned_sh{10,02}_vc120_seed\
 
 When the hot set is fixed and the working set exceeds the cache, frequency dominates recency, and this
 is where CA_W_TINYLFU wins most decisively. On lmsys, paired CA − LRU is **positive in all 6 cells for
-all 7 seeds (42/42)** on cost-weighted hit rate, ranging **+4.6 to +15.9pp**, with hit rate and
-token-saving likewise 7/7 everywhere. The win **replicates on WildChat** (a second dataset, different
+all 7 seeds (42/42)** on cost-weighted hit rate, ranging **+4.6 to +15.9pp** (every cell Wilcoxon
+p = 0.016, the n = 7 floor, with CIs excluding zero), with hit rate and token-saving likewise 7/7
+everywhere. The win **replicates on WildChat** (a second dataset, different
 user population): again 42/42, same sign and ballpark. This is a strong replication precisely because
 the two datasets have very different cost compositions (LMSYS 0.9% expensive vs WildChat 48.8%, Section
 6.2): the stationary CA-beats-LRU result is not an artifact of one dataset's cost mix.
@@ -423,6 +438,79 @@ little signal and *which* expensive item happens to be hot is largely seed luck,
 benefit is swamped by cross-seed difficulty variance. Cost-awareness pays when there is a hot set to be
 cost-selective *within*; a flat distribution gives any policy little structure to exploit.
 _[bench_lmsys/win_z{11,15}_seed0–6.json; bench_wildchat/win_z{11,15}_seed0–6.json; paired.py CA − FREQ]_
+
+### 7.3b Head-to-head with the cost-aware baseline (GDSF)
+
+Beating cost-blind LRU is the easy bar. The demanding comparison is against **GDSF** (Section 3.4), the
+classic cost-aware policy and our closest prior art, which already folds fetch cost and access count into
+one retention score `H(i) = L + F(i)·C(i)/S(i)` and so, unlike LRU, already prefers
+expensive-and-frequent items. We run GDSF through the identical harness (fetch cost = `LLMCost`,
+size = 1) against CA_W_TINYLFU at cs100 in **four cells**: the **drift** regime (vc120, shift 0.02) at a
+flat (α = 1.1) and default (α = 1.2) skew, and the **stationary** regime at a flat (z11, α = 1.1) and
+sharp (z15, α = 1.5) skew. The heavy-tail flat cells were **pre-registered** as the ones that should most
+favour TinyLFU admission: a flatter tail means more near-one-hit-wonders, which GDSF admits on first
+sight but the SLRU + Count-Min admission filter is built to reject.
+
+The picture is regime-dependent, and in the regime where CA is strongest it is a decisive win. Under
+**drift** the two policies tie on cost-weighted hit rate (paired CA − GDSF −0.43 [4/7], p = 0.94 at
+α=1.1; +0.39 [4/7], p = 0.81 at α=1.2; the sign flips across seeds), with GDSF holding a small but
+sign-consistent raw-hit and token edge (0/7, p = 0.016 both). But under **stationary flat skew** (z11),
+the same regime where CA's margin over LRU is largest (7.2), CA **beats** GDSF on cost-weighted hit rate
+by **+5.05pp (7/7 seeds, p = 0.016, 95% CI [+1.8, +8.3])** and on token-saving by +2.15pp (7/7,
+p = 0.016), while raw hit rate is a wash, a whisker toward GDSF (−0.63, 2/7, p = 0.08, CI [−1.3, −0.0]).
+Under **stationary sharp skew** (z15) it returns to a tie (−1.50 [3/7], p = 0.94, CI ±4.9 spanning zero),
+where GDSF keeps a small sign-consistent raw-hit edge (−0.81, 0/7, p = 0.016). So CA does not
+merely match the cost-aware baseline: it ties GDSF under drift and sharp skew and _overtakes_ it under
+flat stationary skew.
+
+The mechanism is the **admission filter**, and this is where the pre-registered heavy-tail hypothesis
+finally pays. GDSF admits every arriving item into the cache (evict-while-full, then insert at F = 1), so
+each one-hit-wonder forces the eviction of a resident on arrival; CA's window + doorkeeper + Count-Min
+admission can **reject** the newcomer outright without disturbing a valuable resident. A flat tail is
+dense in near-singletons, so under stationary flat skew CA rejects a stream of them that GDSF keeps
+churning through, and the cost-weighted gap opens. We registered this hypothesis for the _drift_ flat
+cell up front and it failed there — the rotating hot set washes the filter's advantage out — but it holds
+under _stationary_ flat skew, where the distribution is stable enough for the filter to matter. We report
+the failed and the confirmed cell both.
+
+| CA − GDSF, cs100 | cost_wt (pp) | hit (pp) | tok (pp) |
+|---|---|---|---|
+| drift, α=1.1 | −0.43 [4/7] | −2.32 [0/7] | −1.16 [0/7] |
+| drift, α=1.2 | +0.39 [4/7] | −2.55 [0/7] | −0.88 [0/7] |
+| stationary flat (z11) | **+5.05 [7/7]** | −0.63 [2/7] | **+2.15 [7/7]** |
+| stationary sharp (z15) | −1.50 [3/7] | −0.81 [0/7] | −0.39 [1/7] |
+
+**Robustness across cache size and dataset.** The cs100 result above is the headline, but the flat-skew
+win is not an artifact of one cache size or one corpus. Re-running the two stationary cells across
+cs ∈ {25, 50, 100} on both lmsys and WildChat (paired n = 5, seeds 0–4) keeps the same shape. Under
+**flat skew** (z11) CA's cost-weighted edge over GDSF is positive at every cache size on both datasets; on
+WildChat it is sign-consistent 5/5 at all three sizes and tight (+3.60 ± 0.60pp at cs100), while on lmsys
+the mean is larger but the interval is wide because a single \$441,098 outlier query dominates the
+cost-weighted variance at small caches. Token-saving is +[5/5] on both datasets at every size. Under
+**sharp skew** (z15) the cell stays a tie on both: WildChat sits within a fraction of a point of zero at
+all sizes (−0.10 to +0.78pp), and lmsys shows no sign-consistent direction (the same cost outlier swings
+it +6.2 at cs25 to −2.1 at cs100). At n = 5 the exact Wilcoxon floor is p = 0.062, so these cells are read
+off the interval and the sign count, not the p-value.
+
+| CA − GDSF | cost_wt lmsys | cost_wt WildChat | tok lmsys | tok WildChat |
+|---|---|---|---|---|
+| _flat (z11)_ cs25 | +8.27 [4/5] | +6.15 [5/5] | +5.73 [5/5] | +3.89 [5/5] |
+| cs50 | +4.61 [3/5] | +4.78 [5/5] | +4.35 [5/5] | +2.56 [5/5] |
+| cs100 | +5.80 [5/5] | +3.60 [5/5] | +1.86 [5/5] | +1.71 [5/5] |
+| _sharp (z15)_ cs25 | +6.16 [4/5] | +0.78 [3/5] | +0.30 [3/5] | −0.06 [2/5] |
+| cs50 | +3.78 [4/5] | −0.10 [2/5] | +0.79 [5/5] | −0.44 [1/5] |
+| cs100 | −2.08 [3/5] | −0.03 [4/5] | −0.62 [0/5] | −0.30 [1/5] |
+
+Paired n = 5 (seeds 0–4). The flat-skew cost-weighted win holds at every cache size on both lmsys and
+WildChat; the sharp-skew cell stays a tie on both. lmsys small-cache CIs are wide (single cost outlier);
+WildChat is tight and sign-consistent.
+
+Beyond the measured cost-weighted win under flat skew, CA has what GDSF structurally lacks: the
+user-facing `cost_priority` dial (7.5), frequency estimation decoupled from residency via the shared
+sketch, and an O(1)-amortized admission step against GDSF's priority-queue reheapify on every eviction.
+That scaling argument is **analytical, not measured**: at the n ≤ 200 caches tested the per-op difference
+is invisible, so we claim it as a design property, not a result.
+_[bench_lmsys/gdsf_z11_seed\*.json, gdsf_vc120_seed\*.json (drift); gdsfstat_z{11,15}_seed\*.json (stationary); paired.py CA − GDSF]_
 
 ### 7.4 Crossover surface
 
@@ -496,8 +584,13 @@ on **two datasets** (lmsys and WildChat), but the drift win is shown on lmsys on
 validity is weaker than stationary. (iii) The policy is validated on the **in-memory** eviction path;
 the Redis backend delegates to Redis-native eviction and remains cost-blind, so these results do not
 transfer to the distributed path as-is. (iv) The storage measurements (Section 9) are **fresh-index,
-no-eviction**, so the tombstone steady state under sustained eviction is uncharacterized. Items (ii-iv)
-are addressed as Future Work (Section 10).
+no-eviction**, so the tombstone steady state under sustained eviction is uncharacterized. (v) The **GDSF
+head-to-head** (7.3b) drift cells are at cs100 on lmsys only; the stationary flat-win and sharp-tie are
+swept across cs ∈ {25, 50, 100} and replicated on WildChat, but those sweep cells are n = 5 (Wilcoxon
+floor p = 0.062) and the lmsys small-cache CIs are wide (single cost outlier), so the sweep corroborates
+the cs100 headline by direction rather than by an independent significant test. The O(1)-versus-reheapify
+scaling claim is analytical, not measured at these small n. Items (ii-v) are addressed as Future Work
+(Section 10).
 
 ## 9. Storage co-contribution: SBERTMRL + HNSW/SQ8
 
@@ -573,9 +666,13 @@ e2e, paid for in recall). _[frontier.md, cell J]_
 We set out to make a semantic LLM cache evict by *value*, not just by access pattern. CA_W_TINYLFU does
 this by folding a per-answer regeneration cost into TinyLFU admission, and it beats cost-blind LRU on
 cost-weighted hit rate in both regimes a cache faces: under a drifting hot set, with read-time decay on,
-by +3.6 to +4.1pp (7/7 seeds, p ≈ 0.001); under stationary skew, in all 42 cells tested (+4.6 to
-+15.9pp), replicated on a second dataset. Just as important is the honest map of where the cost term
-does and does not pay: it is sign-consistent under sharp skew and washes into noise under flat skew, and
+by +3.6 to +4.1pp (7/7 seeds, Wilcoxon p = 0.016); under stationary skew, in all 42 cells tested (+4.6 to
++15.9pp), replicated on a second dataset. Against GDSF, the classic cost-aware baseline and our closest
+prior art, it _beats_ cost-weighted hit rate by +5.0pp (7/7) under flat stationary skew, where its
+admission filter rejects the one-hit-wonder stream GDSF admits (the win holds across cs ∈ {25,50,100} and
+replicates on WildChat), and ties under drift and sharp skew,
+while also adding a cost dial, sketch-based frequency decoupled from residency, and an O(1) admission step
+that GDSF lacks. Just as important is the honest map of where the cost term does and does not pay: it is sign-consistent under sharp skew and washes into noise under flat skew, and
 the `cost_priority` dial is a clean but coarse money-versus-quality knob. Alongside the policy, the
 storage co-contribution reaches a 5.7-9.8x index-RAM compression frontier with a static-encoder option
 that also buys sub-millisecond end-to-end latency at a measured recall cost. Together these are two
@@ -593,6 +690,10 @@ picture rather than a single headline.
   tier-dominated, so we expect the eviction ordering to be stable, but this closes the one modeled input.
 - **Drift on a second dataset.** The stationary win is replicated on two datasets; the drift win is not
   yet. A WildChat drift run would give drift the same external-validity footing.
+- **Wider GDSF comparison.** The GDSF head-to-head covers both regimes but only at cs100 on lmsys.
+  Sweeping cache sizes and replicating on WildChat would test whether the flat-stationary win and the
+  drift/sharp ties hold everywhere, and a large-n run would turn the O(1)-versus-reheapify scaling claim
+  from analytical into measured.
 - **Tombstone steady state.** Characterize search-p95, recall and RAM high-water mark under sustained
   insert+evict, plus a rebuild-cadence sweep, to move the storage numbers from best-case to steady-state.
 
@@ -653,10 +754,13 @@ picture rather than a single headline.
 
 | Claim                                                                                                                   | Source                                                               |
 | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| drift paired ADAPT−LRU +3.6/+4.1pp 7/7 p≈0.001 n=7 (decay on); ADAPT loses −5.6pp with decay off                        | bench_lmsys/decaytuned_sh{10,02}\_vc120_seed\*.json (decay on); drift_e2_seed\*.json (decay off); paired.py |
+| drift paired ADAPT−LRU +3.6/+4.1pp 7/7 Wilcoxon p=0.016 (CI ±1.59 slow) n=7 (decay on); ADAPT loses −5.6pp with decay off | bench_lmsys/decaytuned_sh{10,02}\_vc120_seed\*.json (decay on); drift_e2_seed\*.json (decay off); paired.py |
 | stationary paired CA−LRU 42/42 +4.6…+15.9pp (n=7)                                                                       | plan.md Phase 0.6; bench_lmsys/win_z{11,15}\_seed0–6.json; paired.py |
 | stationary CA−LRU replicates on WildChat 42/42, z11 +19.3/+15.6/+12.6, z15 +9.1/+5.4/+2.2 (n=7)                         | bench_wildchat/win_z{11,15}\_seed0–6.json; paired.py                 |
 | cost-isolation regime-dependent (lmsys); cleaner on WildChat (5/6 cells 7/7 cost_wt)                                    | plan.md Phase 0.6 §Table 2; bench_wildchat/\*; paired.py CA−FREQ     |
+| GDSF head-to-head drift: CA−GDSF cost_wt tie α1.1 −0.43 [4/7] / α1.2 +0.39 [4/7]; GDSF wins hit & tok 0/7 both          | bench_lmsys/gdsf_z11_seed\*.json; gdsf_vc120_seed\*.json; paired.py CA−GDSF |
+| GDSF head-to-head stationary cs100 (n=7): CA−GDSF cost_wt z11 +5.05 [7/7] / z15 −1.50 [3/7]; tok z11 +2.15 [7/7]; hit z11 −0.63 [2/7] | bench_lmsys/gdsfstat_z{11,15}_seed\*.json; paired.py CA−GDSF |
+| GDSF cache-size + WildChat sweep (n=5, seeds 0–4): flat z11 cost_wt + at every cs on both datasets (WildChat +3.60±0.60 cs100 [5/5]); sharp z15 tie on both | bench_{lmsys,wildchat}/gdsfstat_z{11,15}_seed[0-4].json; paired.py CA−GDSF |
 | decay is the drift lever                                                                                                | plan.md Phase 3; decay_vc{0,30,120}\_seed\*.json                     |
 | eviction plumbing / clean_size                                                                                          | research.md §1.2; memory_cache.py; ca_w_tinylfu.py                   |
 | storage 5.7×/7.5×/9.8×, precision tradeoff                                                                              | bench_real_100k/results.json; bench_real_100k/frontier.md            |

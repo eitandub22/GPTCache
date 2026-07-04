@@ -58,14 +58,22 @@ class MemoryCacheEviction(EvictionBase):
                 on_evict=on_evict,
                 **kwargs,
             )
+        elif self._policy == "GDSF":
+            from gptcache.manager.eviction.gdsf import GreedyDualSizeFrequency
+            # clean_size not forwarded: GDSF evicts exactly enough to make room.
+            self._cache = GreedyDualSizeFrequency(
+                maxsize=maxsize,
+                on_evict=on_evict,
+                **kwargs,
+            )
         else:
             raise ValueError(f"Unknown policy {policy}")
 
-        if self._policy != "CA_W_TINYLFU":
+        if self._policy not in ("CA_W_TINYLFU", "GDSF"):
             self._cache.popitem = popitem_wrapper(self._cache.popitem, on_evict, clean_size)
 
     def put(self, objs: List[Any], costs=None):
-        if self._policy == "CA_W_TINYLFU":
+        if self._policy in ("CA_W_TINYLFU", "GDSF"):
             self._cache.put(objs, costs=costs)
         else:
             for obj in objs:
