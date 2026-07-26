@@ -13,10 +13,12 @@ __all__ = [
     "Rwkv",
     "PaddleNLP",
     "UForm",
+    "CachedEmbedding",
 ]
 
 
 from gptcache.utils.lazy_import import LazyImport
+from gptcache.embedding.cached_embedding import CachedEmbedding
 
 openai = LazyImport("openai", globals(), "gptcache.embedding.openai")
 huggingface = LazyImport("huggingface", globals(), "gptcache.embedding.huggingface")
