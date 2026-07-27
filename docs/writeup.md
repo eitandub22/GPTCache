@@ -659,7 +659,79 @@ the storage frontier has three honest operating points, not one: **A** (recall a
 compression), **E/G** (compression, encoder-bound e2e), and **J** (compression *and* sub-millisecond
 e2e, paid for in recall). _[frontier.md, cell J]_
 
-## 10. Conclusion
+## 10. Embedding-cache co-contribution: CachedEmbedding
+
+> **DRAFTED PROSE. Grounded in `bench_embedding_cache/results_seed{0-6}.json` and `paired_stats.json`.**
+
+The eviction policy (§4) decides which *answers* stay resident; the storage section (§9) shrinks how each
+kept *vector* is stored. Neither touches a cheaper miss further upstream: every incoming request, hit or
+miss, first pays for an embedding forward pass, and GPTCache's default `embedding_func` recomputes that
+pass from scratch even when the exact same text was embedded moments earlier. `CachedEmbedding` closes
+that specific gap. _[gptcache/embedding/cached_embedding.py]_
+
+### 10.1 Design: an LRU wrapper, not a new encoder
+
+`CachedEmbedding` decorates any existing `BaseEmbedding` backend (SBERT, OpenAI, ...) with an in-process
+LRU cache (`cachetools.LRUCache`) keyed on the exact input string. On a cache hit it returns a defensive
+copy of the stored vector without touching the wrapped model; on a miss it delegates, then stores a copy
+for next time. Composition rather than inheritance means it drops in around any backend with one line and
+changes nothing about the rest of the stack — no core file was modified. Two implementation details matter
+for correctness: results are copied on both the read and write path, so a caller mutating a returned array
+in place cannot corrupt the cached entry, and only hashable string inputs are cached — list/batch calls and
+non-text backends (image, audio) pass straight through untouched. _[tests/unit_tests/embedding/test_cached_embedding.py,
+8/8 passing]_
+
+### 10.2 Honesty trap: this is an exact-match cache, not a semantic one
+
+The benefit of `CachedEmbedding` is capped by one number: how often the *exact same string* recurs in the
+traffic. GPTCache's vector search already resolves near-duplicates and paraphrases at the similarity-search
+layer, so this cache cannot and does not attempt to help there — it only ever fires on a byte-for-byte
+repeat. We do not assume a savings figure. A `--dataset synthetic` mode fixes the exact-repeat ratio for a
+network-free structural smoke test, and every real-data run prints the *measured* exact-duplicate ratio of
+its query stream before reporting any speedup, so a low number is a valid, reportable result on a
+low-repeat corpus, not a bug to be hidden. On a single pass through 2,000 distinct UltraChat prompts
+(`--dataset ultrachat`, no replay) the duplicate ratio measures 0.0% and the cache correctly shows no
+benefit (1.02x) — the honest negative result the trap is designed to surface. _[bench_embedding_cache/results.json]_
+
+### 10.3 Why a separate benchmark script, not `benchmark_lmsys.py`
+
+`benchmark_lmsys.py` (§6) computes every embedding once, up front, in a single batched `model.encode(...)`
+call, then looks vectors up by index during the eviction replay. That is a correct, deliberate optimization
+of *that* harness — it isolates eviction-policy cost from embedding cost — but it means the harness never
+calls `to_embeddings()` per incoming query, so it structurally cannot exercise a per-query embedding cache.
+`benchmark_embedding_cache.py` is a separate script that reuses `benchmark_lmsys.py`'s loaders and
+`drift_query_stream` verbatim, but walks the resulting stream one prompt at a time, calling
+`to_embeddings()` per query — faithfully reproducing how a live GPTCache deployment actually calls
+`embedding_func`. Neither script was modified to accommodate the other. _[examples/benchmark/benchmark_embedding_cache.py]_
+
+### 10.4 Result: consistent, statistically significant speedup under realistic repeat traffic
+
+We replay 5,000 UltraChat queries through the same Zipf-skewed, hot-set-rotating stream generator
+(`drift_query_stream`) that §6–7 use for the eviction experiments, over 7 seeds, and time a plain SBERT
+encoder against the same encoder wrapped in `CachedEmbedding` (cache size 10,000, back-to-back within each
+seed's run to hold background conditions constant across the two arms). The measured exact-duplicate ratio
+of this stream is 75.6–76.5% across seeds, and cache hit rate tracks it almost exactly in every seed
+(e.g. seed 0: 76.5% duplicates → 76.5% hit rate), which is itself a correctness check: the cache is neither
+under- nor over-firing relative to the traffic it sees.
+
+The cache was faster than the uncached baseline in **7/7 seeds** (range 3.18x–4.79x, geometric mean
+**3.80x**, robust to one noisy run), Wilcoxon signed-rank **p = 0.0156** — significant at α = 0.05 despite
+the small n. Absolute wall-clock times varied across runs on the (shared, non-isolated) benchmark machine —
+e.g. baseline ranged 176–210s across seeds for a fixed 5,000-query stream — which is machine noise, not
+signal; the paired, within-seed comparison is what the significance claim rests on, following the same
+paired-seed protocol §6.7 uses for the eviction results. _[bench_embedding_cache/paired_stats.json]_
+
+### 10.5 Scope and limits
+
+This result says nothing about semantic near-duplicates, which are out of scope by design (§10.2). It also
+does not model cache eviction under memory pressure: `cache_size=10,000` was large enough that no entry
+observed in this run was evicted before being re-requested, so the measured hit rate is an upper bound for
+this workload size, not a general guarantee — a corpus with more distinct hot text than the cache can hold
+would show a lower hit rate, degrading gracefully via the underlying LRU rather than failing. Finally, like
+§9's storage numbers, this is a fresh-process, single-workload measurement; a production deployment would
+want to additionally track cache memory footprint over long uptime, which we did not measure here.
+
+## 11. Conclusion
 
 > **DRAFTED PROSE.**
 
@@ -675,9 +747,13 @@ while also adding a cost dial, sketch-based frequency decoupled from residency, 
 that GDSF lacks. Just as important is the honest map of where the cost term does and does not pay: it is sign-consistent under sharp skew and washes into noise under flat skew, and
 the `cost_priority` dial is a clean but coarse money-versus-quality knob. Alongside the policy, the
 storage co-contribution reaches a 5.7-9.8x index-RAM compression frontier with a static-encoder option
-that also buys sub-millisecond end-to-end latency at a measured recall cost. Together these are two
-independent, separately measured improvements to the same open-source cache, each reported as a Pareto
-picture rather than a single headline.
+that also buys sub-millisecond end-to-end latency at a measured recall cost, and a third, independent
+co-contribution — `CachedEmbedding`, an exact-match LRU wrapper around the embedding call — delivers a
+consistent 3.80x (geometric mean) wall-clock speedup on repeat-heavy traffic (7/7 seeds, Wilcoxon
+p = 0.016), with its benefit and its limits both pinned to a single measured number: the exact-duplicate
+ratio of the traffic it sees. Together these are three independent, separately measured improvements to
+the same open-source cache, each reported as a Pareto picture or an honesty-capped result rather than a
+single headline.
 
 ### Future work
 
@@ -768,3 +844,8 @@ picture rather than a single headline.
 | FP rise = encoder swap (+14.4pp), not truncation                                                                        | bench_real_100k/results.json (cell I); frontier.md §isolation        |
 | e2e latency rises (encoder-bound); search ~100×                                                                         | bench_real_100k/results.json e2e_latency_ms                          |
 | cost_priority dial: paired cp1−cp0 cost_wt +2.5pp (7/7) ↔ hit% −4.1pp (0/7); all cp beat LFU cost_wt +6.3…8.8pp (6–7/7) | bench_cost_priority/cp_seed{0..6}.json                               |
+
+| CachedEmbedding: 7/7 seeds faster, geometric mean 3.80x (range 3.18-4.79x), Wilcoxon p=0.0156           | bench_embedding_cache/results_seed{0-6}.json; paired_stats.json      |
+| CachedEmbedding hit rate tracks measured exact-duplicate ratio almost exactly per seed (e.g. 76.5%→76.5%) | bench_embedding_cache/results_seed0.json                             |
+| CachedEmbedding: single-pass distinct-prompt stream (no replay) has 0.0% duplicates, correctly shows no benefit (1.02x) | bench_embedding_cache/results.json                                   |
+| CachedEmbedding unit correctness: cache/miss counting, copy-on-read/write, non-string bypass, LRU eviction, clear() | tests/unit_tests/embedding/test_cached_embedding.py (8/8 passing)    |
