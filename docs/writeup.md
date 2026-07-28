@@ -731,7 +731,86 @@ would show a lower hit rate, degrading gracefully via the underlying LRU rather 
 §9's storage numbers, this is a fresh-process, single-workload measurement; a production deployment would
 want to additionally track cache memory footprint over long uptime, which we did not measure here.
 
-## 11. Conclusion
+## 11. Concurrent embedding dispatcher co-contribution: EmbeddingDispatcher
+
+> **DRAFTED PROSE. Grounded in `bench_embedding_dispatcher/results_run{1,2,3}.json`.**
+
+Sections 4 and 10 both target the embedding call in isolation: what to keep resident, and whether to
+recompute it at all. Neither touches how that call behaves *under concurrent load*. GPTCache's default
+`embedding_func` is synchronous and single-process (`adapter.py`): concurrent callers queue on one CPU
+core rather than being served in parallel. `EmbeddingDispatcher` closes this gap by fanning per-request
+embedding calls across multiprocessing worker processes. _[gptcache/embedding/dispatcher.py]_
+
+### 11.1 Design: a process pool, not hand-rolled queues
+
+`EmbeddingDispatcher` wraps `concurrent.futures.ProcessPoolExecutor` rather than building IPC queues by
+hand, specifically to avoid a well-known class of Windows-specific bugs (the "spawn" start method
+re-imports the interpreter per worker and requires everything crossing the process boundary to be
+picklable). Each worker builds its own model instance exactly once, at pool-start time, and reuses it for
+every task; `embedding_factory` must therefore be a **picklable, module-level callable, not a lambda** --
+a lambda fails to pickle under spawn, which we enforce and document rather than let fail silently.
+_[tests/unit_tests/embedding/test_dispatcher.py, 8/8 passing]_
+
+### 11.2 Why multiprocessing, not threading
+
+The brainstorm this contribution is drawn from explicitly considered threading first and rejected it:
+Python's GIL blocks the tokenize and pre/post-processing phases of an embedding call even though the
+tensor math itself (in PyTorch) releases the GIL, so threading alone leaves part of the per-call cost
+serialized. We checked the one condition that would overturn this -- Python 3.13's experimental
+free-threaded (no-GIL) build -- on the benchmark machine before writing any code: `sys._is_gil_enabled()`
+reports the GIL is active (standard build), so the multiprocessing recommendation stands as specified.
+_[directions.md §3]_
+
+### 11.3 Honesty trap: memory cost is real, and larger than the back-of-envelope estimate
+
+The brainstorm's back-of-envelope estimate was "~80MB x N workers" for MiniLM. Measured RSS across 8
+workers is **~4.2GB, roughly 8x the naive estimate** -- because each worker process loads the full PyTorch
+runtime, not just the model weights, and that runtime overhead dominates. This is summed across the main
+process and every live worker child (`psutil`'s `children(recursive=True)`), not just the main process --
+an earlier draft of this benchmark measured only the main process and *completely missed* the duplication
+cost, reporting a flat ~700MB-1.3GB that only reflected normal single-process memory growth. Catching and
+fixing that is itself part of the honesty trap this section reports on plainly, not around.
+_[bench_embedding_dispatcher/results_run1.json rss_mb fields]_
+
+Worker *startup* (process spawn, slow on Windows) is a second, separate cost: every benchmark run warms
+the pool (one call per worker) before timing starts, so the one-time spawn cost cannot hide inside --
+or inflate -- the steady-state throughput number.
+
+### 11.4 Result: a real crossover, not a uniform win
+
+We measure throughput (queries/s) and p50/p99 latency across concurrency levels {1, 10, 50, 100}, sequential
+(N caller threads sharing one model instance, today's behavior) vs `EmbeddingDispatcher` (same N threads,
+routed across 8 worker processes), on real SBERT embeddings over UltraChat prompts, repeated 3 times:
+
+| Concurrency | Speedup (run 1 / 2 / 3) | Mean speedup |
+|---|---|---|
+| 1   | 0.56x / 0.54x / 0.59x | **0.56x** (dispatcher loses) |
+| 10  | 0.79x / 0.78x / 0.83x | **0.80x** (dispatcher loses) |
+| 50  | 1.19x / 1.47x / 1.70x | **1.45x** (dispatcher wins) |
+| 100 | 1.90x / 2.01x / 1.93x | **1.95x** (dispatcher wins) |
+
+The crossover is consistent across all 3 runs: below roughly 30-50 concurrent callers, IPC overhead
+outweighs any parallelism gained, and the dispatcher is a net loss; above it, the sequential baseline's
+throughput *degrades* under GIL contention among its own caller threads (40.9 -> 24.4 -> 16.5 q/s from
+concurrency 10 to 100 in run 1) while the dispatcher's throughput stays roughly flat (~29-33 q/s at every
+level from 50 up), because each worker is a fully separate process with no GIL to contend over. The
+practically important number is p99 tail latency at concurrency=100, which improved by **58-60% in every
+run** (9037ms -> 3758ms; 9274ms -> 3713ms; 9393ms -> 3718ms) -- the metric that most directly reflects a
+real user's worst-case wait. _[bench_embedding_dispatcher/results_run{1,2,3}.json]_
+
+### 11.5 Scope and limits
+
+This benchmark simulates concurrent callers as threads within one Python process issuing blocking calls,
+which is the right shape for GPTCache's synchronous `embedding_func` contract, but does not model a
+multi-process web server (e.g. multiple Gunicorn/uWSGI workers) sharing one dispatcher pool, which a real
+deployment might use instead. The crossover point (~30-50 callers) is specific to an 8-worker pool on this
+machine's core count and to MiniLM's per-call cost; a different core count, worker count, or model size
+would shift it, not eliminate it. Finally, the 4.2GB memory cost is fixed regardless of load -- it is paid
+in full even at concurrency=1, where the dispatcher is a net throughput loss, so the deployment decision is
+a real tradeoff (tail-latency headroom at high concurrency, bought with a memory floor that helps nothing
+at low concurrency), not a strictly dominant choice.
+
+## 12. Conclusion
 
 > **DRAFTED PROSE.**
 
@@ -747,13 +826,16 @@ while also adding a cost dial, sketch-based frequency decoupled from residency, 
 that GDSF lacks. Just as important is the honest map of where the cost term does and does not pay: it is sign-consistent under sharp skew and washes into noise under flat skew, and
 the `cost_priority` dial is a clean but coarse money-versus-quality knob. Alongside the policy, the
 storage co-contribution reaches a 5.7-9.8x index-RAM compression frontier with a static-encoder option
-that also buys sub-millisecond end-to-end latency at a measured recall cost, and a third, independent
+that also buys sub-millisecond end-to-end latency at a measured recall cost, a third, independent
 co-contribution — `CachedEmbedding`, an exact-match LRU wrapper around the embedding call — delivers a
 consistent 3.80x (geometric mean) wall-clock speedup on repeat-heavy traffic (7/7 seeds, Wilcoxon
 p = 0.016), with its benefit and its limits both pinned to a single measured number: the exact-duplicate
-ratio of the traffic it sees. Together these are three independent, separately measured improvements to
-the same open-source cache, each reported as a Pareto picture or an honesty-capped result rather than a
-single headline.
+ratio of the traffic it sees, and a fourth co-contribution — `EmbeddingDispatcher`, a multiprocess fan-out
+for the embedding call — trades a measured ~4.2GB fixed memory cost for a consistent throughput and
+tail-latency win above a real, repeatable crossover point (~30-50 concurrent callers), improving p99
+latency by 58-60% at 100 concurrent callers across 3 repeated runs, while being a net loss below that
+point. Together these are four independent, separately measured improvements to the same open-source
+cache, each reported as a Pareto picture or an honesty-capped result rather than a single headline.
 
 ### Future work
 
@@ -844,8 +926,11 @@ single headline.
 | FP rise = encoder swap (+14.4pp), not truncation                                                                        | bench_real_100k/results.json (cell I); frontier.md §isolation        |
 | e2e latency rises (encoder-bound); search ~100×                                                                         | bench_real_100k/results.json e2e_latency_ms                          |
 | cost_priority dial: paired cp1−cp0 cost_wt +2.5pp (7/7) ↔ hit% −4.1pp (0/7); all cp beat LFU cost_wt +6.3…8.8pp (6–7/7) | bench_cost_priority/cp_seed{0..6}.json                               |
-
 | CachedEmbedding: 7/7 seeds faster, geometric mean 3.80x (range 3.18-4.79x), Wilcoxon p=0.0156           | bench_embedding_cache/results_seed{0-6}.json; paired_stats.json      |
 | CachedEmbedding hit rate tracks measured exact-duplicate ratio almost exactly per seed (e.g. 76.5%→76.5%) | bench_embedding_cache/results_seed0.json                             |
 | CachedEmbedding: single-pass distinct-prompt stream (no replay) has 0.0% duplicates, correctly shows no benefit (1.02x) | bench_embedding_cache/results.json                                   |
 | CachedEmbedding unit correctness: cache/miss counting, copy-on-read/write, non-string bypass, LRU eviction, clear() | tests/unit_tests/embedding/test_cached_embedding.py (8/8 passing)    |
+| EmbeddingDispatcher: crossover at ~30-50 concurrent callers, mean speedup 0.56x/0.80x/1.45x/1.95x at concurrency 1/10/50/100 (3 runs) | bench_embedding_dispatcher/results_run{1,2,3}.json |
+| EmbeddingDispatcher p99 latency improvement at concurrency=100: 58-60% across 3 runs (9037→3758ms; 9274→3713ms; 9393→3718ms) | bench_embedding_dispatcher/results_run{1,2,3}.json |
+| EmbeddingDispatcher memory cost: measured ~4.2GB (8 workers, main+children RSS), ~8x the back-of-envelope 80MB×N estimate | bench_embedding_dispatcher/results_run1.json rss_mb fields |
+| EmbeddingDispatcher unit correctness: pickling constraint, shutdown idempotency, post-shutdown errors, deterministic results | tests/unit_tests/embedding/test_dispatcher.py (8/8 passing) |
