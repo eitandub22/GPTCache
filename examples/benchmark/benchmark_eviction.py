@@ -6,9 +6,8 @@ Goal: produce a clean, fast, reproducible comparison of eviction policies
 on a workload that *actually* exercises eviction (small cache vs. large
 item pool, with re-access).
 
-Capture a BASELINE with this script before implementing CA-W-TinyLFU.
-After Phase 1-2 lands, re-run with `--policies LRU,LFU,FIFO,CA_W_TINYLFU`
-and diff the JSON output.
+Pass `--policies LRU,LFU,FIFO,CA_W_TINYLFU` to compare the cost-aware policy
+against the classic baselines and diff the JSON output.
 
 Why this exists separately from `benchmark_qqp.py`:
   - `benchmark_qqp.py` sets `max_size = max(scale * 2, 100_000)`, so
@@ -55,10 +54,9 @@ from gptcache.manager.eviction.ca_w_tinylfu import LLMCost
 class Item:
     """Synthetic cache item with heterogeneous regeneration cost.
 
-    `cost` follows the same shape as the planned `LLMCost.cost` property:
+    `cost` follows the same shape as the `LLMCost.cost` property:
         latency_ms × model_tier × (1 + tokens / 1000)
-    so CA-W-TinyLFU's utility function will operate on the same units
-    when the policy lands.
+    so CA_W_TINYLFU's utility function operates on the same units.
     """
 
     key: int
@@ -205,7 +203,7 @@ def main():
                    help="Fraction of items in the 'expensive' tier (default: 0.10)")
     p.add_argument("--policies", default="LRU,LFU,FIFO,RR",
                    help="Comma-separated policies to compare. "
-                        "Add CA_W_TINYLFU once Phase 1-2 lands.")
+                        "CA_W_TINYLFU is supported too.")
     p.add_argument("--seed", type=int, default=0,
                    help="RNG seed for reproducibility (default: 0)")
     p.add_argument("--workdir", default="bench_eviction_baseline",
@@ -284,8 +282,8 @@ def main():
             indent=2,
         )
     print(f"\n  Wrote results to {out_path}")
-    print("\n  NOTE: this is a BASELINE. Re-run with --policies LRU,LFU,FIFO,CA_W_TINYLFU")
-    print("        after Phase 1-2 of the W-TinyLFU plan lands, and diff the JSON.")
+    print("\n  TIP: pass --policies LRU,LFU,FIFO,CA_W_TINYLFU to compare against the")
+    print("       cost-aware policy, and diff the JSON.")
 
 
 if __name__ == "__main__":

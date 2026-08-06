@@ -72,8 +72,8 @@ class LLMCost:
     wall-clock delay and model pricing tier in a single scalar.
 
     Defaults give every item an identical cost, collapsing the policy to
-    W-TinyLFU + EWMA decay — still better than LRU before Phase 4 plumbs
-    real latency/token counts through the adapter.
+    W-TinyLFU + EWMA decay — still better than LRU until real latency/token
+    counts are plumbed through the adapter.
     """
 
     generation_latency_ms: float = DEFAULT_GENERATION_LATENCY_MS
@@ -308,7 +308,8 @@ class CostAwareWTinyLFU:
         1. Doorkeeper-gated sketch increment + last-access timestamp.
         2. Segment routing: protected → touch; probation → promote; window → touch.
 
-    Public API matches MemoryCacheEviction (put / get / policy) for Phase 2 routing.
+    Public API matches MemoryCacheEviction (put / get / policy) so the manager
+    routes to it interchangeably.
     """
 
     def __init__(
@@ -620,7 +621,7 @@ class CostAwareWTinyLFU:
 
         The objective is the *cost-weighted* hit rate (``adapt_objective="cost"``)
         — the novel twist vs. Caffeine, which climbs raw hit rate. Three guards
-        against the §2.0 "climbs the wrong way" failure:
+        against the "climbs the wrong way" failure:
 
           1. The decision uses the *mean* objective over ``_decision_intervals``
              intervals, not one noisy interval.
@@ -661,7 +662,7 @@ class CostAwareWTinyLFU:
         Stage 1 (at W0+probe): bank that objective, jump down to W0-probe.
         Stage 2 (at W0-probe): pick the step sign toward the better side and
         start the real climb. Probing both sides — not just continuing to grow —
-        removes the §2.0 "always grows first" bias, and a probe of maxsize/8
+        removes the "always grows first" bias, and a probe of maxsize/8
         gives a gradient signal even when W0 sits in a locally-flat region.
         """
         if self._probe_stage == 0:

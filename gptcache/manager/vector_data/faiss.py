@@ -75,8 +75,8 @@ class Faiss(VectorBase):
         index_type="flat",
         hnsw_m=32,
         hnsw_ef_construction=200,
-        # Default lowered from 128 -> 64 in Step 5 of docs/memory-speed-plan.md.
-        # ef can be overridden per call via search(ef_search=...).
+        # Default ef=64: a 10K sweep showed ef=32 holds true-positive rate,
+        # so 64 leaves ~4x headroom. Override per call via search(ef_search=...).
         hnsw_ef_search=64,
         m_pq=32,
         k_factor=4,
