@@ -147,9 +147,8 @@ class VectorBase:
             index_type = kwargs.get("index_type", "flat")
             hnsw_m = kwargs.get("hnsw_m", 32)
             hnsw_ef_construction = kwargs.get("hnsw_ef_construction", 200)
-            # Default lowered from 128 -> 64 in Step 5 (docs/memory-speed-plan.md).
-            # 10K synthetic sweep showed ef=32 holds TP and ef=64 leaves 4x headroom;
-            # see docs/efsearch-sweep.md. Override per-call via Faiss.search(ef_search=...).
+            # Default ef=64: a 10K sweep showed ef=32 holds true-positive rate,
+            # so 64 leaves ~4x headroom. Override per-call via Faiss.search(ef_search=...).
             hnsw_ef_search = kwargs.get("hnsw_ef_search", 64)
             # PQ knobs for index_type "hnsw_pq"/"hnsw_pq_refine" (ignored otherwise).
             m_pq = kwargs.get("m_pq", 32)

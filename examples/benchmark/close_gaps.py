@@ -9,8 +9,8 @@ Gap 1 - threshold tuning for MRL/256
     tuned for ONNX/768. Sweep the threshold and pick the value where
     cell D's FP rate matches cell A's ~6%, while keeping the TP gain.
 
-Gap 2 - exact-match shortcut (Step 4) measured with real encoder
-    The 10K real run had --exact-repeat-frac=0.0, so Step 4's payoff
+Gap 2 - exact-match shortcut measured with real encoder
+    The 10K real run had --exact-repeat-frac=0.0, so the shortcut's payoff
     was projected (2000-5000x) but never measured. Measure it now.
 
 Implementation note - the existing Cell D FAISS+SQLite artifact in
@@ -317,13 +317,13 @@ def main():
             "optimization work itself.\n\n"
         )
 
-        f.write("## Gap 2 - exact-match shortcut (Step 4), measured\n\n")
+        f.write("## Gap 2 - exact-match shortcut, measured\n\n")
         f.write(
             f"Workload: {n_repeat} exact-repeat queries (top {args.exact_frac*100:.0f}% of "
             f"the TP query set), replayed {args.repeats} times after a {args.warmup}-query warmup. "
             f"Baseline path = `encoder.to_embeddings(q) + data_manager.search(emb)` "
             f"(what the cache does today on a miss); shortcut path = "
-            f"`cache.exact_match_cache.get(q)` (the Step 4 fast path).\n\n"
+            f"`cache.exact_match_cache.get(q)` (the exact-match fast path).\n\n"
         )
         f.write("| Path | p50 (ms) | p95 (ms) | p99 (ms) | mean (ms) |\n")
         f.write("|---|---|---|---|---|\n")
@@ -358,7 +358,7 @@ def main():
             f"recalibration. With the recommended threshold cell D ships **TP "
             f"{chosen['tp_rate']*100:.1f}% / FP {chosen['fp_rate']*100:.1f}%** vs cell A's "
             f"**TP 81.7% / FP 6.4%** - strict Pareto improvement.\n"
-            f"2. **Step 4's user-facing payoff is real**: {sp_p50:.0f}x speedup on the "
+            f"2. **The shortcut's user-facing payoff is real**: {sp_p50:.0f}x speedup on the "
             f"repeat tail with a real encoder. For any workload where >5-10% of queries "
             f"are exact textual repeats (system prompts, canned FAQs, agent self-talk) "
             f"the end-to-end latency drop is dominated by this path. The TTL/LRU bound "

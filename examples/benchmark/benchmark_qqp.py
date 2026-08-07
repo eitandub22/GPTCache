@@ -1,6 +1,6 @@
 """GPTCache QQP Benchmark (4-cell isolation matrix)
 
-Implements BP1-BP6 from docs/memory-speed-plan.md:
+Benchmark points (BP1-BP6):
 
   BP1 - 4-cell encoder x index matrix:
         A: ONNX 768d + Flat        (true baseline - what users have today)
@@ -501,13 +501,13 @@ def _percentiles(values):
 
 def measure_exact_match_shortcut(encoder, data_manager, repeat_queries, warmup, repeats):
     """Compare time-to-answer for an exact-repeat query through:
-       (a) embed + search (the path BEFORE Step 4)
-       (b) exact_match_cache.get (the Step 4 shortcut)
+       (a) embed + search (the path without the shortcut)
+       (b) exact_match_cache.get (the exact-match shortcut)
 
     The exact-match cache is populated up front with the same queries so
     every lookup is a guaranteed hit.
 
-    Returns dict with shortcut_ms (Step 4 path) and baseline_ms (without).
+    Returns dict with shortcut_ms (shortcut path) and baseline_ms (without).
     """
     from gptcache import cache as global_cache  # local import to avoid name collision
     emc = getattr(global_cache, "exact_match_cache", None)
@@ -681,7 +681,7 @@ def run_cell(spec, data, args, threads, encoder_cache):
         threshold_sweep=sweep_list,
     )
 
-    # Optional: exercise the Step 4 exact-match shortcut on a slice of the
+    # Optional: exercise the exact-match shortcut on a slice of the
     # TP query set. Only meaningful on cell D (the production config),
     # but we measure on any cell - the lever is encoder/index agnostic.
     exact_match_metrics = None
@@ -799,7 +799,7 @@ def main():
     p.add_argument("--exact-repeat-frac", type=float, default=0.0,
                    help="Fraction of the TP query workload to clone as exact repeats "
                         "(0.0..1.0). With >0 the harness runs an additional measurement "
-                        "with the gptcache.adapter pipeline so the Step 4 exact-match "
+                        "with the gptcache.adapter pipeline so the exact-match "
                         "shortcut can be exercised end-to-end. Default 0.0.")
     args = p.parse_args()
 

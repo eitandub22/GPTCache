@@ -26,16 +26,16 @@ def _embed_task(data):
 
 class EmbeddingDispatcher(BaseEmbedding):
     """Fan per-request embedding calls across multiprocessing worker
-    processes, so concurrent callers are served in parallel instead of
-    queueing on a single process.
+    processes.
 
-    GPTCache's default embedding call is synchronous and single-process:
-    concurrent callers serialize on one CPU core. This dispatcher spins up
-    num_workers OS processes, each holding its own copy of the embedding
-    model, and routes to_embeddings() calls to them via a process pool.
-    This targets throughput under concurrent load, not single-call
-    latency -- a single caller sees no benefit (and some IPC overhead) from
-    this wrapper; the benefit shows up when many callers overlap.
+    This helps ONLY when the underlying encoder holds the GIL during compute
+    or serializes on a single device -- e.g. a pure-Python encoder, or one
+    GPU. For a torch/SBERT CPU encoder it does NOT help: torch releases the
+    GIL during encode, so a threaded single process already saturates the
+    cores, and the per-task IPC here (pickling vectors back through the pool's
+    single result queue) makes fan-out slower and costs one model copy per
+    worker in RAM -- see examples/benchmark/benchmark_dispatcher.py. Kept as
+    an opt-in for the GIL-bound / GPU case.
 
     IMPORTANT (Windows / pickling): embedding_factory must be a
     picklable, zero-argument callable -- a module-level function or a

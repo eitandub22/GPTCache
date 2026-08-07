@@ -10,8 +10,8 @@ Usage
   python sweep_efsearch.py --scale 100000 --workdir sweep_work_100k
 
 The output is also written to ``docs/efsearch-sweep.md`` (use --out to
-override). Step 5 of docs/memory-speed-plan.md picks the lowest value
-that holds the precision threshold from docs/benchmark-baseline.md.
+override). Pick the lowest ef_search that still holds the precision
+threshold for your workload.
 """
 import argparse
 import csv
