@@ -14,11 +14,10 @@ so the worker-duplication cost is measured, not assumed.
 HONESTY TRAP (see directions.md)
 Each worker duplicates the model in memory (~80MB for MiniLM x N workers) --
 we measure and print RSS, not just claim a throughput win. RSS is summed
-across the main process AND every live worker child process -- measuring
-only the main process would silently miss the entire duplication cost.
-Worker startup (process spawn -- slow on Windows) is a one-time cost paid
-once when the pool is created, so every run warms the pool up before
-timing, matching real deployment where workers start once at boot.
+across the main process AND every live worker child process. Worker startup
+(process spawn -- slow on Windows) is a one-time cost paid once when the
+pool is created, so every run warms the pool up before timing, matching
+real deployment where workers start once at boot.
 
 Usage:
   python examples/benchmark/benchmark_embedding_dispatcher.py --dataset synthetic
@@ -79,10 +78,6 @@ def load_prompts(args):
 
 
 def get_rss_mb(include_children=False):
-    """Resident memory in MB. With include_children=True, sums this
-    process's RSS plus every live child process's RSS -- that's the number
-    that actually reflects the worker-duplication cost. Returns None if
-    psutil isn't installed."""
     try:
         import psutil
         proc = psutil.Process(os.getpid())
@@ -174,7 +169,7 @@ def main():
     p.add_argument("--concurrency-levels", default="1,10,50,100")
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", default="bench_embedding_dispatcher/results.json")
+    p.add_argument("--out", default="bench_embedding_dispatcher/results_ayala.json")
     args = p.parse_args()
 
     factory = make_synthetic_embedding if args.dataset == "synthetic" else make_sbert_embedding
