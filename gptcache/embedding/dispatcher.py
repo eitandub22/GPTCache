@@ -28,14 +28,17 @@ class EmbeddingDispatcher(BaseEmbedding):
     """Fan per-request embedding calls across multiprocessing worker
     processes.
 
-    This helps ONLY when the underlying encoder holds the GIL during compute
-    or serializes on a single device -- e.g. a pure-Python encoder, or one
-    GPU. For a torch/SBERT CPU encoder it does NOT help: torch releases the
-    GIL during encode, so a threaded single process already saturates the
-    cores, and the per-task IPC here (pickling vectors back through the pool's
-    single result queue) makes fan-out slower and costs one model copy per
-    worker in RAM -- see examples/benchmark/benchmark_dispatcher.py. Kept as
-    an opt-in for the GIL-bound / GPU case.
+    Targets embedding *throughput* under concurrent load, not single-call
+    latency -- a lone caller sees only IPC overhead and is slower. Measured on
+    an SBERT/MiniLM CPU encoder over UltraChat (3 runs, see
+    examples/benchmark/benchmark_embedding_dispatcher.py): the dispatcher loses
+    below ~50 concurrent callers (process dispatch + per-task IPC exceed the
+    per-encode work) and wins up to ~2x at 50-100, where one shared model under
+    many threads contends but 8 independent worker processes do not. The cost
+    is memory: one model copy per worker, a ~5 GB RSS floor paid at pool
+    creation regardless of load, vs ~1 GB sequential. A throughput-vs-memory
+    Pareto point -- worth it only for a server fielding many overlapping
+    requests. Measured on one machine; the crossover point is host-dependent.
 
     IMPORTANT (Windows / pickling): embedding_factory must be a
     picklable, zero-argument callable -- a module-level function or a

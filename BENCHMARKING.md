@@ -8,7 +8,7 @@ numbers come from replaying seeds 0–6 and pairing per-seed.
 |---|---|---|---|
 | 1 | `CA_W_TINYLFU` cost-aware eviction | `examples/benchmark/benchmark_lmsys.py` | `bench_lmsys/`, `bench_wildchat/` |
 | 2 | SBERTMRL + HNSW/SQ8 storage | `examples/benchmark/benchmark_qqp.py` | `bench_real_100k/` |
-| 3 | `EmbeddingDispatcher` fan-out | `examples/benchmark/benchmark_dispatcher.py` | `bench_embedding_dispatcher/` |
+| 3 | `EmbeddingDispatcher` fan-out | `examples/benchmark/benchmark_embedding_dispatcher.py` | `bench_embedding_dispatcher/` |
 | 6 | `CachedEmbedding` exact-repeat cache | `examples/benchmark/benchmark_embedding_cache.py` | `bench_embedding_cache/` |
 
 The reference JSON logs for every table in the report are already checked in under those `bench_*/`
@@ -139,17 +139,19 @@ and correctly yields ~1.02× — see `bench_embedding_cache/README.md`.
 
 ## Contribution 3 — dispatcher (`EmbeddingDispatcher`)
 
-Embedding *throughput* under concurrent load: a single-process encoder (concurrent callers serialize on
-one model) vs. a dispatcher that fans across worker processes. Reports the crossover in Table 7 — the
-dispatcher loses below ~50 concurrent callers (IPC overhead) and wins above it, at a fixed ~5 GB RSS cost.
+Embedding *throughput* under concurrent load: a single-process encoder (concurrent callers contend on
+one shared model) vs. a dispatcher that fans across worker processes. Reports the crossover in Table 7 —
+the dispatcher loses below ~50 concurrent callers (IPC overhead) and wins above it, up to ~2×, at a fixed
+~5 GB RSS cost. The crossover point is host-dependent; numbers are from one machine.
 
 ```bash
-# offline plumbing check -- real worker processes, no model download
-python examples/benchmark/benchmark_dispatcher.py --self-check
+# offline plumbing check -- real worker processes, synthetic (no-download) encoder
+python examples/benchmark/benchmark_embedding_dispatcher.py --dataset synthetic \
+  --n-prompts 40 --concurrency-levels 1,4
 
 # paper run: 3 runs of the recorded crossover (200 prompts, 8 workers)
 for r in 1 2 3; do
-  python examples/benchmark/benchmark_dispatcher.py --dataset ultrachat \
+  python examples/benchmark/benchmark_embedding_dispatcher.py --dataset ultrachat \
     --n-prompts 200 --concurrency-levels 1,10,50,100 \
     --out bench_embedding_dispatcher/results_run$r.json
 done
