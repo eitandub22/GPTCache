@@ -141,20 +141,24 @@ and correctly yields ~1.02× — see `bench_embedding_cache/README.md`.
 
 Embedding *throughput* under concurrent load: a single-process encoder (concurrent callers contend on
 one shared model) vs. a dispatcher that fans across worker processes. Reports the crossover in Table 7 —
-the dispatcher loses below ~50 concurrent callers (IPC overhead) and wins above it, up to ~2×, at a fixed
-~5 GB RSS cost. The crossover point is host-dependent; numbers are from one machine.
+the dispatcher loses below ~15 concurrent callers (IPC overhead), crosses over in an unstable ~15–30
+region, and wins above it, up to ~3.4× at 100, at a fixed ~5 GB RSS cost. The crossover point is
+host-dependent; numbers are from one machine.
 
 ```bash
 # offline plumbing check -- real worker processes, synthetic (no-download) encoder
 python examples/benchmark/benchmark_embedding_dispatcher.py --dataset synthetic \
   --n-prompts 40 --concurrency-levels 1,4
 
-# paper run: 3 runs of the recorded crossover (200 prompts, 8 workers)
+# paper run: 3 runs of the 8-level crossover sweep (200 prompts, 8 workers)
 for r in 1 2 3; do
   python examples/benchmark/benchmark_embedding_dispatcher.py --dataset ultrachat \
-    --n-prompts 200 --concurrency-levels 1,10,50,100 \
-    --out bench_embedding_dispatcher/results_run$r.json
+    --n-prompts 200 --concurrency-levels 1,10,20,30,40,50,75,100 \
+    --out bench_embedding_dispatcher/results_fine_run$r.json
 done
+
+# aggregate the 3 runs into the per-concurrency mean +/- std of Table 7
+python bench_embedding_dispatcher/finegrained_stats.py "bench_embedding_dispatcher/results_fine_run*.json"
 ```
 
 Memory numbers (`rss_mb`, summed over the worker children) require `psutil` (`pip install psutil`);
